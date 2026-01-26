@@ -1,8 +1,8 @@
 # 🐍🚀 p2r: Python to Rust Transpiler
 
-[![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![Rust Version](https://img.shields.io/badge/rust-1.50+-orange.svg)](https://www.rust-lang.org/learn/get-started)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg?style=for-the-badge)](https://www.python.org/downloads/)
+[![Rust Version](https://img.shields.io/badge/rust-1.50+-orange.svg?style=for-the-badge)](https://www.rust-lang.org/learn/get-started)
+[![License](https://img.shields.io/badge/license-MIT-green.svg?style=for-the-badge)](LICENSE)
 
 `p2r` is a static Python to Rust transpiler designed to convert a subset of Python code into idiomatic and performant Rust. It's an experimental project aiming to bridge the gap between Python's ease of use and Rust's safety and speed, by providing a direct translation path for certain patterns.
 
