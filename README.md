@@ -58,7 +58,7 @@ cd p2r
 
 Your Python code *must* include type annotations.
 
-**`example.py`** (or use the demo in the `demo/` folder, it's also precompiled to .exe):
+**`example.py`** (or use the demo in the `demo/` folder ~~,it's also precompiled to .exe~~):
 
 ```python
 x: int = 42
