@@ -1,23 +1,6 @@
-#!/usr/bin/env python3
-"""
-p2r.py - Static Python to Rust Transpiler (FIXED)
--------
-FIXES APPLIED:
-1. ✅ Two-pass compilation (declarations → bodies)
-2. ✅ Proper type unification & CFG merging for branches
-3. ✅ range() → Rust ranges (0..n, a..b)
-4. ✅ Eliminated UNKNOWN from final IR
-5. ✅ Complete statement lowering
-6. ✅ Method signature tracking
-7. ✅ f-string completion
-8. ✅ Proper ownership handling
-9. ✅ Pylance type hinting warnings fixed.
-10.✅ Improved file handling: .rs retained, executables in target path, no dummy files.
-"""
-
 import ast
 import sys
-import argparse
+import typer
 import os
 import subprocess
 from dataclasses import dataclass, field
@@ -1384,115 +1367,91 @@ class RustEmitter:
 # 6. MAIN DRIVER
 # ==============================================================================
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Static Python → Rust Transpiler")
-    parser.add_argument("input", help="Input Python file")
-    parser.add_argument("--output", "-o", default=None, help="Output Rust file (default: <input>.rs)")
-    parser.add_argument("--no-compile", action="store_true", default=False,
-                       help="Only generate .rs file, don't compile to binary")
-    parser.add_argument("--keep-pdb", action="store_true", default=False,
-                       help="Keep .pdb debug symbols file (Windows only)")
-    parser.add_argument("--run", action="store_true", default=False,
-                       help="Execute the compiled binary after successful compilation")
-    args = parser.parse_args()
+app = typer.Typer()
 
+@app.command()
+def main(
+    input: str = typer.Argument(..., help="Input Python file"),
+    output: str = typer.Option(None, "--output", "-o", help="Output Rust file (default: <input>.rs)"),
+    no_compile: bool = typer.Option(False, "--no-compile", help="Only generate .rs file"),
+    keep_pdb: bool = typer.Option(False, "--keep-pdb", help="Keep .pdb debug symbols file (Windows only)"),
+    run: bool = typer.Option(False, "--run", help="Execute the compiled binary after compilation")
+):
     try:
-        with open(args.input, "r", encoding="utf-8") as f: # Specify encoding
+        with open(input, "r", encoding="utf-8") as f:
             source = f.read()
     except FileNotFoundError:
-        print(f"Error: File '{args.input}' not found.", file=sys.stderr)
-        sys.exit(1)
+        typer.echo(f"Error: File '{input}' not found.", err=True)
+        raise typer.Exit(1)
     except Exception as e:
-        print(f"Error reading file '{args.input}': {e}", file=sys.stderr)
-        sys.exit(1)
+        typer.echo(f"Error reading file '{input}': {e}", err=True)
+        raise typer.Exit(1)
 
     try:
-        tree = ast.parse(source, filename=args.input)
+        tree = ast.parse(source, filename=input)
     except SyntaxError as e:
-        print(f"Syntax Error in Python file: {e}", file=sys.stderr)
-        sys.exit(1)
+        typer.echo(f"Syntax Error in Python file: {e}", err=True)
+        raise typer.Exit(1)
 
     compiler = PythonToRustCompiler()
+
     try:
-        # STEP 1: Compile Python to IR and generate Rust code
         ir_module = compiler.compile_module(tree)
         emitter = RustEmitter()
         rust_code = emitter.emit_module(ir_module)
-        
-        # Determine output filename and paths
-        input_dir = os.path.dirname(os.path.abspath(args.input))
-        input_basename_no_ext = os.path.splitext(os.path.basename(args.input))[0]
 
-        if args.output is None:
+        input_dir = os.path.dirname(os.path.abspath(input))
+        input_basename_no_ext = os.path.splitext(os.path.basename(input))[0]
+
+        if output is None:
             output_rs_path = os.path.join(input_dir, f"{input_basename_no_ext}.rs")
         else:
-            # If --output is specified, use it directly.
-            # If it's just a filename, put it in input_dir. If it's a full path, use that.
-            if not os.path.isabs(args.output):
-                output_rs_path = os.path.join(input_dir, args.output)
-            else:
-                output_rs_path = args.output
-        
-        # STEP 2: Write Rust code to file (always keep .rs file by default)
+            output_rs_path = output if os.path.isabs(output) else os.path.join(input_dir, output)
+
         with open(output_rs_path, 'w', encoding="utf-8") as f:
             f.write(rust_code)
-        print(f"[STEP 1] Generated: {output_rs_path}", file=sys.stderr)
-        
-        # STEP 3: Compile Rust to binary (if not --no-compile)
-        if not args.no_compile:
-            # Determine output binary path
-            output_bin_name = input_basename_no_ext # e.g., 'test'
-            if sys.platform == 'win32':
-                output_bin_name += '.exe'
-            output_bin_path = os.path.join(input_dir, output_bin_name)
-            
-            print(f"[STEP 2] Compiling: rustc {output_rs_path} -o {output_bin_path}", file=sys.stderr)
-            
-            # Use a list for command and direct subprocess.run
-            rustc_command = ['rustc', output_rs_path, '-o', output_bin_path]
-            
-            # For Windows, also specify the target-dir to keep build artifacts in one place
-            # if sys.platform == 'win32':
-            #     rustc_command.extend(['--emit', 'dep-info,link,metadata,pdb,asm,llvm-ir,obj', '--target-dir', input_dir])
+        typer.echo(f"[STEP 1] Generated: {output_rs_path}", err=True)
 
-            result = subprocess.run(rustc_command, capture_output=True, text=True, cwd=input_dir)
-            
+        if not no_compile:
+            output_bin_name = input_basename_no_ext + ('.exe' if sys.platform == 'win32' else '')
+            output_bin_path = os.path.join(input_dir, output_bin_name)
+
+            typer.echo(f"[STEP 2] Compiling: rustc {output_rs_path} -o {output_bin_path}", err=True)
+
+            result = subprocess.run(['rustc', output_rs_path, '-o', output_bin_path], capture_output=True, text=True, cwd=input_dir)
+
             if result.returncode != 0:
-                print(f"[ERROR] Rust compilation failed:", file=sys.stderr)
-                print(result.stdout, file=sys.stderr) # stdout might contain warnings
-                print(result.stderr, file=sys.stderr)
-                # Cleanup the .rs file if compilation failed
-                # os.remove(output_rs_path) # Retain .rs file always as per new instruction
-                sys.exit(1)
-            
-            print(f"[STEP 2] Compiled: {output_bin_path}", file=sys.stderr)
-            
-            # STEP 4: Run the binary (if --run flag)
-            if args.run:
-                print(f"[STEP 3] Running: {output_bin_path}", file=sys.stderr)
-                run_result = subprocess.run([output_bin_path], capture_output=False, cwd=input_dir)
+                typer.echo("[ERROR] Rust compilation failed:", err=True)
+                typer.echo(result.stdout, err=True)
+                typer.echo(result.stderr, err=True)
+                raise typer.Exit(1)
+
+            typer.echo(f"[STEP 2] Compiled: {output_bin_path}", err=True)
+
+            if run:
+                typer.echo(f"[STEP 3] Running: {output_bin_path}", err=True)
+                run_result = subprocess.run([output_bin_path], cwd=input_dir)
                 if run_result.returncode != 0:
-                    print(f"[ERROR] Program exited with non-zero code: {run_result.returncode}", file=sys.stderr)
-                    sys.exit(1)
-            
-            # STEP 5: Clean up .pdb files on Windows if not --keep-pdb
-            if not args.keep_pdb and sys.platform == 'win32':
+                    typer.echo(f"[ERROR] Program exited with code: {run_result.returncode}", err=True)
+                    raise typer.Exit(1)
+
+            if not keep_pdb and sys.platform == 'win32':
                 pdb_file = os.path.join(input_dir, f"{input_basename_no_ext}.pdb")
                 if os.path.exists(pdb_file):
                     try:
                         os.remove(pdb_file)
-                        print(f"[CLEANUP] Removed: {pdb_file}", file=sys.stderr)
+                        typer.echo(f"[CLEANUP] Removed: {pdb_file}", err=True)
                     except Exception as e:
-                        print(f"[WARN] Could not remove {pdb_file}: {e}", file=sys.stderr)
+                        typer.echo(f"[WARN] Could not remove {pdb_file}: {e}", err=True)
         else:
-            print(f"[SKIP] Compilation to binary skipped (--no-compile)", file=sys.stderr)
-            
+            typer.echo("[SKIP] Compilation skipped (--no-compile)", err=True)
+
     except CompilerError:
-        # Custom CompilerError already prints message and exits
-        sys.exit(1)
+        raise typer.Exit(1)
     except Exception as e:
-        print(f"\n[CRITICAL ERROR] An unexpected error occurred: {e}", file=sys.stderr)
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-        
+        typer.echo(f"\n[CRITICAL ERROR] {e}", err=True)
+        raise typer.Exit(1)
+
+if __name__ == "__main__":
+    app()
+    
