@@ -1,18 +1,16 @@
 import ast
-import sys
-import typer
+import glob
 import os
 import subprocess
+import sys
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Union, Tuple, Set, cast
 from enum import Enum, auto
+from typing import NoReturn, cast
 
-# ==============================================================================
-# 1. TYPE SYSTEM & IR
-# ==============================================================================
 
 class RustTypeKind(Enum):
     UNIT = auto()
+    VOID = auto()
     BOOL = auto()
     I64 = auto()
     F64 = auto()
@@ -22,57 +20,63 @@ class RustTypeKind(Enum):
     STRUCT = auto()
     OPTION = auto()
     RANGE = auto()
-    # Add an 'UNKNOWN' kind for initial stages, to be eliminated later
-    UNKNOWN = auto() 
+
 
 @dataclass
 class RustType:
     kind: RustTypeKind
     name: str = ""
-    inner: List['RustType'] = field(default_factory=list)
+    inner: list["RustType"] = field(default_factory=list)
 
-    def __repr__(self):
-        if self.kind == RustTypeKind.UNIT: return "()"
-        if self.kind == RustTypeKind.BOOL: return "bool"
-        if self.kind == RustTypeKind.I64: return "i64"
-        if self.kind == RustTypeKind.F64: return "f64"
-        if self.kind == RustTypeKind.STRING: return "String"
-        if self.kind == RustTypeKind.VEC: return f"Vec<{self.inner[0]}>"
-        if self.kind == RustTypeKind.HASHMAP: return f"HashMap<{self.inner[0]}, {self.inner[1]}>"
-        if self.kind == RustTypeKind.OPTION: return f"Option<{self.inner[0]}>"
-        if self.kind == RustTypeKind.STRUCT: return self.name
-        if self.kind == RustTypeKind.RANGE: return "std::ops::Range<i64>"
-        if self.kind == RustTypeKind.UNKNOWN: return "UNKNOWN" # Should not appear in final IR
-        return "UnknownType"
+    def __repr__(self) -> str:
+        m = {
+            RustTypeKind.UNIT: "()",
+            RustTypeKind.VOID: "()",
+            RustTypeKind.BOOL: "bool",
+            RustTypeKind.I64: "i64",
+            RustTypeKind.F64: "f64",
+            RustTypeKind.STRING: "String",
+            RustTypeKind.VEC: f"Vec<{self.inner[0]}>" if self.inner else "Vec<?>",
+            RustTypeKind.HASHMAP: (
+                f"HashMap<{self.inner[0]},{self.inner[1]}>"
+                if len(self.inner) >= 2
+                else "HashMap<?,?>"
+            ),
+            RustTypeKind.STRUCT: self.name,
+            RustTypeKind.OPTION: (
+                f"Option<{self.inner[0]}>" if self.inner else "Option<?>"
+            ),
+            RustTypeKind.RANGE: "std::ops::Range<i64>",
+        }
+        return m.get(self.kind, "?")
 
-    def is_primitive(self):
-        return self.kind in {RustTypeKind.BOOL, RustTypeKind.I64, RustTypeKind.F64}
+    def unify(self, o: "RustType") -> bool:
+        return (self.kind == o.kind if self.kind == o.kind else False) and (
+            self.name == o.name
+            if self.kind == RustTypeKind.STRUCT
+            else (
+                all(s.unify(x) for s, x in zip(self.inner, o.inner))
+                if len(self.inner) == len(o.inner)
+                else False
+            )
+        )
 
-    def clone_needed(self):
-        return not self.is_primitive() and self.kind != RustTypeKind.UNIT and self.kind != RustTypeKind.RANGE
-
-    def unify(self, other: 'RustType') -> bool:
-        """Check if types are unifiable (same kind & inner types)"""
-        if self.kind == RustTypeKind.UNKNOWN or other.kind == RustTypeKind.UNKNOWN:
-            return True # UNKNOWN can unify with anything during inference, but should be resolved
-        if self.kind != other.kind: return False
-        if self.kind == RustTypeKind.STRUCT: return self.name == other.name
-        if len(self.inner) != len(other.inner): return False
-        return all(s.unify(o) for s, o in zip(self.inner, other.inner))
-
-# --- IR Nodes ---
 
 @dataclass
 class IRExpr:
     rtype: RustType
 
+
 @dataclass
 class IRLiteral(IRExpr):
     value: str
+    is_input_prompt: bool = False
+
 
 @dataclass
 class IRVariable(IRExpr):
     name: str
+
 
 @dataclass
 class IRBinaryOp(IRExpr):
@@ -80,41 +84,49 @@ class IRBinaryOp(IRExpr):
     op: str
     right: IRExpr
 
+
 @dataclass
 class IRUnaryOp(IRExpr):
     op: str
     operand: IRExpr
 
+
 @dataclass
 class IRCall(IRExpr):
     func_name: str
-    args: List[IRExpr]
+    args: list[IRExpr]
     is_method: bool = False
-    instance: Optional[IRExpr] = None
+    instance: IRExpr | None = None
+
 
 @dataclass
 class IRFieldAccess(IRExpr):
     instance: IRExpr
     field: str
 
+
 @dataclass
 class IRListCtor(IRExpr):
-    elements: List[IRExpr]
+    elements: list[IRExpr]
+
 
 @dataclass
 class IRDictCtor(IRExpr):
-    keys: List[IRExpr]
-    values: List[IRExpr]
+    keys: list[IRExpr]
+    values: list[IRExpr]
+
 
 @dataclass
 class IRStructCtor(IRExpr):
     struct_name: str
-    fields: List[Tuple[str, IRExpr]]  # (field_name, value)
+    fields: list[tuple[str, IRExpr]]
+
 
 @dataclass
 class IRFString(IRExpr):
-    fmt_str: str  # Raw format string without quotes
-    args: List[IRExpr]
+    fmt_str: str
+    args: list[IRExpr]
+
 
 @dataclass
 class IRRangeCtor(IRExpr):
@@ -122,21 +134,31 @@ class IRRangeCtor(IRExpr):
     end: IRExpr
     exclusive: bool = True
 
+
+@dataclass
+class IRIndexAccess(IRExpr):
+    container: IRExpr
+    index: IRExpr
+
+
 @dataclass
 class IRStmt:
     pass
+
 
 @dataclass
 class IRVarDecl(IRStmt):
     name: str
     rtype: RustType
     is_mut: bool
-    init: Optional[IRExpr]
+    init: IRExpr | None
+
 
 @dataclass
 class IRAssign(IRStmt):
-    target: str  # Simple name for now
+    target: str
     value: IRExpr
+
 
 @dataclass
 class IRFieldAssign(IRStmt):
@@ -144,70 +166,64 @@ class IRFieldAssign(IRStmt):
     field_name: str
     value: IRExpr
 
+
 @dataclass
 class IRExprStmt(IRStmt):
     expr: IRExpr
 
+
 @dataclass
 class IRIf(IRStmt):
     condition: IRExpr
-    then_block: List[IRStmt]
-    else_block: Optional[List[IRStmt]]
-    # Type state after if (for type merging)
-    then_types: Dict[str, RustType] = field(default_factory=dict)
-    else_types: Dict[str, RustType] = field(default_factory=dict)
+    then_block: list[IRStmt]
+    else_block: list[IRStmt] | None = None
+
 
 @dataclass
 class IRWhile(IRStmt):
     condition: IRExpr
-    body: List[IRStmt]
+    body: list[IRStmt]
+
 
 @dataclass
 class IRFor(IRStmt):
     target_name: str
     iterator: IRExpr
-    body: List[IRStmt]
+    body: list[IRStmt]
+
 
 @dataclass
 class IRReturn(IRStmt):
-    value: Optional[IRExpr]
+    value: IRExpr | None = None
+
 
 @dataclass
 class IRFuncDecl:
     name: str
-    args: List[Tuple[str, RustType]]
+    args: list[tuple[str, RustType]]
     ret_type: RustType
-    body: List[IRStmt]
+    body: list[IRStmt]
     is_method: bool = False
-    self_type: Optional[RustType] = None
+    self_type: RustType | None = None
+
 
 @dataclass
 class IRStructDecl:
     name: str
-    fields: List[Tuple[str, RustType]]
+    fields: list[tuple[str, RustType]]
+
 
 @dataclass
 class IRModule:
-    structs: List[IRStructDecl]
-    funcs: List[IRFuncDecl]
-    main_block: List[IRStmt]
+    structs: list[IRStructDecl]
+    funcs: list[IRFuncDecl]
+    main_block: list[IRStmt]
 
-# ==============================================================================
-# 2. ERROR HANDLING
-# ==============================================================================
 
-class CompilerError(Exception):
-    pass
-
-def fail(msg: str, node: Optional[ast.AST] = None):
-    lineno = getattr(node, 'lineno', '?') if node else '?'
-    print(f"\n[ERROR] at line {lineno}:", file=sys.stderr)
-    print(f"   {msg}\n", file=sys.stderr)
+def fail(m: str, n: ast.AST | None = None) -> NoReturn:
+    print(f"\n❌ Line {getattr(n,'lineno','?')}: {m}\n", file=sys.stderr)
     sys.exit(1)
 
-# ==============================================================================
-# 3. SYMBOL TABLE
-# ==============================================================================
 
 @dataclass
 class SymbolInfo:
@@ -216,1242 +232,986 @@ class SymbolInfo:
     is_mut: bool = False
     is_arg: bool = False
 
+
 class SymbolTable:
     def __init__(self):
-        self.scopes: List[Dict[str, SymbolInfo]] = [{}]
-        self.struct_defs: Dict[str, Dict[str, RustType]] = {}
-        # Stores (func_name -> (arg_types, ret_type))
-        self.func_sigs: Dict[str, Tuple[List[RustType], RustType]] = {} 
-        # Stores ((struct_name, method_name) -> (arg_types, ret_type))
-        self.method_sigs: Dict[Tuple[str, str], Tuple[List[RustType], RustType]] = {} 
+        self.scopes: list[dict[str, SymbolInfo]] = [{}]
+        self.struct_defs: dict[str, dict[str, RustType]] = {}
+        self.method_sigs: dict[tuple[str, str], tuple[list[RustType], RustType]] = {}
+        self.func_sigs: dict[str, tuple[list[RustType], RustType]] = {}
 
-    def enter_scope(self):
+    def enter_scope(self) -> None:
         self.scopes.append({})
 
-    def exit_scope(self):
-        self.scopes.pop()
+    def exit_scope(self) -> None:
+        self.scopes.pop() if len(self.scopes) > 1 else None
 
-    def declare(self, name: str, rtype: RustType, is_mut: bool = False, is_arg: bool = False):
+    def declare(
+        self, name: str, rtype: RustType, is_mut: bool = False, is_arg: bool = False
+    ) -> None:
         self.scopes[-1][name] = SymbolInfo(name, rtype, is_mut, is_arg)
 
-    def lookup(self, name: str) -> Optional[SymbolInfo]:
-        for scope in reversed(self.scopes):
-            if name in scope:
-                return scope[name]
+    def lookup(self, name: str) -> SymbolInfo | None:
+        for s in reversed(self.scopes):
+            if name in s:
+                return s[name]
         return None
 
-    def update_type(self, name: str, new_type: RustType):
-        """Update variable type (for shadowing/control flow)"""
-        for scope in reversed(self.scopes):
-            if name in scope:
-                scope[name].rtype = new_type
-                return
-        # If not found, declare it as a new mutable variable (e.g., in a conditional branch)
-        self.declare(name, new_type, is_mut=True)
+    def register_struct(self, name: str, fields: dict[str, RustType]) -> None:
+        self.struct_defs = getattr(self, "struct_defs", {}) | {name: fields}
 
-    def register_struct(self, name: str, fields: Dict[str, RustType]):
-        self.struct_defs[name] = fields
+    def get_struct_field_type(self, sn: str, f: str) -> RustType | None:
+        return getattr(self, "struct_defs", {}).get(sn, {}).get(f)
 
-    def get_struct_field_type(self, struct_name: str, field: str) -> Optional[RustType]:
-        if struct_name in self.struct_defs:
-            return self.struct_defs[struct_name].get(field)
-        return None
+    def register_method(
+        self, sn: str, mn: str, at: list[RustType], rt: RustType
+    ) -> None:
+        self.method_sigs = getattr(self, "method_sigs", {}) | {(sn, mn): (at, rt)}
 
-    def register_method(self, struct_name: str, method_name: str, 
-                       arg_types: List[RustType], ret_type: RustType):
-        self.method_sigs[(struct_name, method_name)] = (arg_types, ret_type)
+    def get_method_sig(
+        self, sn: str, mn: str
+    ) -> tuple[list[RustType], RustType] | None:
+        return getattr(self, "method_sigs", {}).get((sn, mn))
 
-    def get_method_sig(self, struct_name: str, method_name: str) -> Optional[Tuple[List[RustType], RustType]]:
-        return self.method_sigs.get((struct_name, method_name))
 
-# ==============================================================================
-# 4. COMPILER (TWO-PASS)
-# ==============================================================================
-
-class PythonToRustCompiler:
+class Compiler:
     def __init__(self):
         self.symtab = SymbolTable()
-        self.current_func_ret_type: RustType = RustType(RustTypeKind.UNIT) # Default to unit for main block
+        self.symtab.struct_defs = {}
+        self.symtab.method_sigs = {}
+        self.symtab.func_sigs = {}
+        self.current_func_ret_type = RustType(RustTypeKind.UNIT)
+        # Register built-in __name__ variable
+        self.symtab.declare("__name__", RustType(RustTypeKind.STRING), is_mut=False)
 
-    def parse_annotation(self, node: Optional[ast.AST]) -> RustType: # pyright: ignore[reportReturnType]
-        if node is None:
-            fail("Type annotation required", node)
+    def parse_anno(self, n: ast.AST | None) -> RustType:
+        if n is None:
+            fail("Type annotation required", n)
 
-        if isinstance(node, ast.Name):
-            if node.id == 'int': return RustType(RustTypeKind.I64)
-            if node.id == 'float': return RustType(RustTypeKind.F64)
-            if node.id == 'bool': return RustType(RustTypeKind.BOOL)
-            if node.id == 'str': return RustType(RustTypeKind.STRING)
-            if node.id in self.symtab.struct_defs:
-                return RustType(RustTypeKind.STRUCT, name=node.id)
-            fail(f"Unknown type: {node.id}", node)
+        if isinstance(n, ast.Constant) and n.value is None:
+            return RustType(RustTypeKind.VOID)
 
-        if isinstance(node, ast.Subscript):
-            # Handle both List[T] and list[T] syntax
-            if isinstance(node.value, ast.Name):
-                base = node.value.id
-            else:
-                fail("Unsupported subscript base, expected a Name (e.g., List, Dict)", node)
-            
-            if base in ('List', 'list'):
-                inner = self.parse_annotation(node.slice)
-                return RustType(RustTypeKind.VEC, inner=[inner])
-            
-            if base in ('Dict', 'dict'):
-                dims: List[RustType] = []
-                if isinstance(node.slice, ast.Tuple):
-                    dims = [self.parse_annotation(e) for e in node.slice.elts]
+        if isinstance(n, ast.Name):
+            m: dict[str, RustType] = {
+                "int": RustType(RustTypeKind.I64),
+                "float": RustType(RustTypeKind.F64),
+                "bool": RustType(RustTypeKind.BOOL),
+                "str": RustType(RustTypeKind.STRING),
+                "None": RustType(RustTypeKind.VOID),
+            }
+            if n.id in m:
+                return m[n.id]
+            if n.id in self.symtab.struct_defs:
+                return RustType(RustTypeKind.STRUCT, name=n.id)
+            fail(f"Unknown type {n.id}", n)
+
+        if isinstance(n, ast.Subscript):
+            if not isinstance(n.value, ast.Name):
+                fail("Bad subscript", n)
+
+            base = n.value.id
+
+            if base in ("List", "list"):
+                return RustType(RustTypeKind.VEC, inner=[self.parse_anno(n.slice)])
+
+            if base in ("Dict", "dict"):
+                if isinstance(n.slice, ast.Tuple):
+                    dims = [self.parse_anno(e) for e in n.slice.elts]
                 else:
-                    # If it's not a tuple, it's a single type param (invalid for dict)
-                    fail("Dict requires 2 type arguments (e.g., Dict[K, V])", node.slice)
+                    dims = [self.parse_anno(n.slice)]
                 if len(dims) != 2:
-                    fail("Dict requires 2 type arguments", node)
+                    fail("Dict needs [K,V]", n)
                 return RustType(RustTypeKind.HASHMAP, inner=dims)
-            
-            if base in ('Optional', 'option'):
-                inner = self.parse_annotation(node.slice)
-                return RustType(RustTypeKind.OPTION, inner=[inner])
 
-        fail(f"Unsupported type annotation: {ast.dump(node)}", node) # pyright: ignore[reportArgumentType]
+        fail("Bad type", n)
 
-    def infer_literal_type(self, node: ast.Constant) -> RustType: # pyright: ignore[reportReturnType]
-        if isinstance(node.value, bool): return RustType(RustTypeKind.BOOL)
-        if isinstance(node.value, int): return RustType(RustTypeKind.I64)
-        if isinstance(node.value, float): return RustType(RustTypeKind.F64)
-        if isinstance(node.value, str): return RustType(RustTypeKind.STRING)
-        if node.value is None: return RustType(RustTypeKind.UNIT)
-        fail(f"Unknown literal type: {type(node.value)}", node)
+    def infer_lit(self, n: ast.Constant) -> RustType:
+        if isinstance(n.value, bool):
+            return RustType(RustTypeKind.BOOL)
+        if isinstance(n.value, int):
+            return RustType(RustTypeKind.I64)
+        if isinstance(n.value, float):
+            return RustType(RustTypeKind.F64)
+        if isinstance(n.value, str):
+            return RustType(RustTypeKind.STRING)
+        if n.value is None:
+            return RustType(RustTypeKind.UNIT)
+        fail("Bad literal", n)
 
-    def rust_string_literal(self, s: str) -> str:
-        """Convert Python string to Rust String literal (with proper escaping)"""
-        # Ensure s is a string before calling replace
-        if not isinstance(s, str):
-            fail(f"Expected string literal, got {type(s)}", None) # No specific node for this internal call
-        escaped = s.replace('\\', '\\\\').replace('"', '\\"')
-        return f'"{escaped}"'
+    def rust_str(self, s: str) -> str:
+        return (
+            f'"{s.replace(chr(92),chr(92)+chr(92)).replace(chr(34),chr(92)+chr(34))}"'
+        )
 
-    def visit_expr(self, node: ast.expr) -> IRExpr: # pyright: ignore[reportReturnType]
-        if isinstance(node, ast.Constant):
-            rtype = self.infer_literal_type(node)
-            val: str
-            if rtype.kind == RustTypeKind.BOOL:
-                val = str(node.value).lower()
-            elif rtype.kind == RustTypeKind.STRING:
-                val = self.rust_string_literal(cast(str, node.value)) # Cast to str after type check
-            elif node.value is None:
-                val = "()" # Rust unit type
-            else:
-                val = str(node.value)
-            return IRLiteral(rtype, val)
-
-        elif isinstance(node, ast.Name):
-            sym = self.symtab.lookup(node.id)
-            if not sym:
-                fail(f"Undefined variable '{node.id}'", node)
-            return IRVariable(sym.rtype, node.id) # pyright: ignore[reportOptionalMemberAccess]
-
-        elif isinstance(node, ast.BinOp):
-            lhs = self.visit_expr(node.left)
-            rhs = self.visit_expr(node.right)
-
-            if not lhs.rtype.unify(rhs.rtype):
-                fail(f"Type mismatch in binary operation: {lhs.rtype} vs {rhs.rtype}", node)
-
-            op_map = {
-                ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/",
-                ast.Mod: "%", ast.BitOr: "|", ast.BitAnd: "&", ast.BitXor: "^"
+    def visit_expr(self, n: ast.expr | None) -> IRExpr:
+        if n is None:
+            fail("Unexpected None expr")
+        if isinstance(n, ast.Constant):
+            t = self.infer_lit(n)
+            v = (
+                str(n.value).lower()
+                if t.kind == RustTypeKind.BOOL
+                else (
+                    self.rust_str(str(n.value))
+                    if t.kind == RustTypeKind.STRING
+                    else "()" if n.value is None else str(n.value)
+                )
+            )
+            return IRLiteral(t, v)
+        if isinstance(n, ast.Name):
+            s = self.symtab.lookup(n.id)
+            if s is None:
+                fail(f"Undefined {n.id}", n)
+            return IRVariable(s.rtype, n.id)
+        if isinstance(n, ast.BinOp):
+            l, r = self.visit_expr(n.left), self.visit_expr(n.right)
+            fail("Type mismatch", n) if not l.rtype.unify(r.rtype) else None
+            m = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/", ast.Mod: "%"}
+            o = m.get(type(n.op))
+            fail("Bad op", n) if not o else None
+            return IRBinaryOp(l.rtype, l, o, r)
+        if isinstance(n, ast.Compare):
+            fail("Chained comp unsupported", n) if len(n.ops) > 1 else None
+            l, r = self.visit_expr(n.left), self.visit_expr(n.comparators[0])
+            fail("Type mismatch", n) if not l.rtype.unify(r.rtype) else None
+            m = {
+                ast.Eq: "==",
+                ast.NotEq: "!=",
+                ast.Lt: "<",
+                ast.LtE: "<=",
+                ast.Gt: ">",
+                ast.GtE: ">=",
             }
-            op_str = op_map.get(type(node.op))
-            if op_str is None:
-                fail(f"Unsupported binary operator: {type(node.op).__name__}", node)
+            op_node = n.ops[0]
+            o = m.get(type(op_node))
+            if o is None:
+                fail("Bad op", n)
+            return IRBinaryOp(RustType(RustTypeKind.BOOL), l, o, r)
+        if isinstance(n, ast.BoolOp):
+            o = "&&" if isinstance(n.op, ast.And) else "||"
+            c = self.visit_expr(n.values[0])
+            fail("Bad bool", n) if c.rtype.kind != RustTypeKind.BOOL else None
+            for v in n.values[1:]:
+                x = self.visit_expr(v)
+                fail("Bad bool", v) if x.rtype.kind != RustTypeKind.BOOL else None
+                c = IRBinaryOp(RustType(RustTypeKind.BOOL), c, o, x)
+            return c
+        if isinstance(n, ast.UnaryOp):
+            op = self.visit_expr(n.operand)
+            if isinstance(n.op, ast.Not):
+                fail("Not bool", n) if op.rtype.kind != RustTypeKind.BOOL else None
+                return IRUnaryOp(RustType(RustTypeKind.BOOL), "!", op)
+            if isinstance(n.op, ast.USub):
+                (
+                    fail("Unary - not num", n)
+                    if op.rtype.kind not in {RustTypeKind.I64, RustTypeKind.F64}
+                    else None
+                )
+                return IRUnaryOp(op.rtype, "-", op)
+            fail("Bad unary", n)
+        if isinstance(n, ast.Call):
+            return self.visit_call(n)
+        if isinstance(n, ast.List):
+            fail("Empty list", n) if not n.elts else None
+            e = [self.visit_expr(x) for x in n.elts]
+            t = e[0].rtype
+            fail("Unhomog", n) if not all(x.rtype.unify(t) for x in e) else None
+            return IRListCtor(RustType(RustTypeKind.VEC, inner=[t]), e)
+        if isinstance(n, ast.Dict):
+            fail("Empty dict", n) if not n.keys else None
+            k = [self.visit_expr(x) for x in n.keys]
+            v = [self.visit_expr(x) for x in n.values]
+            kt = k[0].rtype
+            vt = v[0].rtype
+            fail("Unhomog keys", n) if not all(x.rtype.unify(kt) for x in k) else None
+            fail("Unhomog vals", n) if not all(x.rtype.unify(vt) for x in v) else None
+            return IRDictCtor(RustType(RustTypeKind.HASHMAP, inner=[kt, vt]), k, v)
+        if isinstance(n, ast.Subscript):
+            c, i = self.visit_expr(n.value), self.visit_expr(n.slice)
+            if c.rtype.kind == RustTypeKind.VEC:
+                fail("Index not i64", n) if i.rtype.kind != RustTypeKind.I64 else None
+                return IRIndexAccess(c.rtype.inner[0], c, i)
+            if c.rtype.kind == RustTypeKind.HASHMAP:
+                fail("Key type bad", n) if not i.rtype.unify(c.rtype.inner[0]) else None
+                return IRIndexAccess(
+                    RustType(RustTypeKind.OPTION, inner=[c.rtype.inner[1]]), c, i
+                )
+            fail("Can't index", n)
+        if isinstance(n, ast.Attribute):
+            i = self.visit_expr(n.value)
+            fail("Not struct", n) if i.rtype.kind != RustTypeKind.STRUCT else None
+            f = self.symtab.get_struct_field_type(i.rtype.name, n.attr)
+            fail("No field", n) if not f else None
+            return IRFieldAccess(f, i, n.attr)
+        if isinstance(n, ast.JoinedStr):
+            return self.visit_fstr(n)
+        fail("Bad expr", n)
 
-            # Special handling for string concatenation
-            if op_str == "+" and lhs.rtype.kind == RustTypeKind.STRING:
-                return IRCall(RustType(RustTypeKind.STRING), "format!", 
-                              [IRLiteral(RustType(RustTypeKind.STRING), self.rust_string_literal("{}{}")), lhs, rhs])
+    def visit_call(self, n: ast.Call) -> IRExpr:
+        fn, ae = n.func, [self.visit_expr(a) for a in n.args]
+        if isinstance(fn, ast.Attribute):
+            inst, mn = self.visit_expr(fn.value), fn.attr
+            if inst.rtype.kind == RustTypeKind.VEC:
+                if mn == "append":
+                    fail("append 1", n) if len(ae) != 1 else None
+                    (
+                        fail("Type bad", n)
+                        if not ae[0].rtype.unify(inst.rtype.inner[0])
+                        else None
+                    )
+                    return IRCall(RustType(RustTypeKind.UNIT), "push", ae, True, inst)
+                if mn == "pop":
+                    fail("pop 0", n) if len(ae) != 0 else None
+                    return IRCall(
+                        RustType(RustTypeKind.OPTION, inner=inst.rtype.inner),
+                        "pop",
+                        ae,
+                        True,
+                        inst,
+                    )
+                fail("Bad method", n)
+            if inst.rtype.kind == RustTypeKind.STRING:
+                if mn in ("upper", "lower", "strip", "trim"):
+                    fail("No args", n) if len(ae) != 0 else None
+                    rm = {
+                        "upper": "to_uppercase",
+                        "lower": "to_lowercase",
+                        "strip": "trim",
+                        "trim": "trim",
+                    }.get(mn)
 
-            return IRBinaryOp(lhs.rtype, lhs, op_str, rhs) # pyright: ignore[reportArgumentType]
+                    if rm is None:
+                        fail("Bad string method", n)
 
-        elif isinstance(node, ast.Compare):
-            if len(node.ops) > 1:
-                fail("Chained comparisons unsupported", node)
-
-            left = self.visit_expr(node.left)
-            right = self.visit_expr(node.comparators[0])
-
-            if not left.rtype.unify(right.rtype):
-                fail(f"Type mismatch in comparison: {left.rtype} vs {right.rtype}", node)
-
-            op_map = {
-                ast.Eq: "==", ast.NotEq: "!=", ast.Lt: "<", ast.LtE: "<=",
-                ast.Gt: ">", ast.GtE: ">="
-            }
-            op = op_map.get(type(node.ops[0]))
-            if not op:
-                fail(f"Unsupported comparison operator: {type(node.ops[0]).__name__}", node)
-
-            return IRBinaryOp(RustType(RustTypeKind.BOOL), left, op, right) # pyright: ignore[reportArgumentType]
-
-        elif isinstance(node, ast.BoolOp):
-            op_str = "&&" if isinstance(node.op, ast.And) else "||"
-            
-            # Start with the first operand
-            curr_expr = self.visit_expr(node.values[0])
-            if curr_expr.rtype.kind != RustTypeKind.BOOL:
-                fail(f"Boolean operators need bool operands, got {curr_expr.rtype}", node.values[0])
-            
-            # Chain remaining operands
-            for val_node in node.values[1:]:
-                next_expr = self.visit_expr(val_node)
-                if next_expr.rtype.kind != RustTypeKind.BOOL:
-                    fail(f"Boolean operators need bool operands, got {next_expr.rtype}", val_node)
-                curr_expr = IRBinaryOp(RustType(RustTypeKind.BOOL), curr_expr, op_str, next_expr)
-            
-            return curr_expr
-
-        elif isinstance(node, ast.UnaryOp):
-            operand_expr = self.visit_expr(node.operand)
-            
-            if isinstance(node.op, ast.Not):
-                if operand_expr.rtype.kind != RustTypeKind.BOOL:
-                    fail(f"'not' requires bool operand, got {operand_expr.rtype}", node)
-                return IRUnaryOp(RustType(RustTypeKind.BOOL), "!", operand_expr)
-            
-            if isinstance(node.op, ast.USub):
-                if operand_expr.rtype.kind not in {RustTypeKind.I64, RustTypeKind.F64}:
-                    fail(f"Unary minus requires numeric type, got {operand_expr.rtype}", node)
-                return IRUnaryOp(operand_expr.rtype, "-", operand_expr)
-            
-            if isinstance(node.op, ast.UAdd):
-                if operand_expr.rtype.kind not in {RustTypeKind.I64, RustTypeKind.F64}:
-                    fail(f"Unary plus requires numeric type, got {operand_expr.rtype}", node)
-                return operand_expr  # Unary + is a no-op in Python (and Rust for primitives)
-            
-            fail(f"Unsupported unary operator: {type(node.op).__name__}", node)
-
-        elif isinstance(node, ast.Call):
-            return self.visit_call(node)
-
-        elif isinstance(node, ast.List):
-            if not node.elts:
-                # Require annotation for empty lists
-                fail("Empty list literal requires type annotation (e.g., `x: List[int] = []`)", node)
-            
-            elements = [self.visit_expr(e) for e in node.elts]
-            
-            if not elements: # Should be caught by the check above, but for safety
-                fail("List elements are empty after processing, this should not happen.", node)
-            
-            elem_type = elements[0].rtype
-            
-            for e in elements:
-                if not e.rtype.unify(elem_type):
-                    fail(f"List elements must be homogenous, found {elem_type} and {e.rtype}", node)
-            
-            return IRListCtor(RustType(RustTypeKind.VEC, inner=[elem_type]), elements)
-
-        elif isinstance(node, ast.Dict):
-            if not node.keys:
-                # Require annotation for empty dicts
-                fail("Empty dict literal requires type annotation (e.g., `x: Dict[str, int] = {}`)", node)
-            
-            keys = [self.visit_expr(k) for k in node.keys] # pyright: ignore[reportArgumentType]
-            vals = [self.visit_expr(v) for v in node.values]
-            
-            if not keys or not vals: # Should be caught by the check above, but for safety
-                fail("Dict keys or values are empty after processing, this should not happen.", node)
-
-            k_type = keys[0].rtype
-            v_type = vals[0].rtype
-            
-            for k in keys:
-                if not k.rtype.unify(k_type):
-                    fail(f"Dict keys must be homogenous, found {k_type} and {k.rtype}", node)
-            for v in vals:
-                if not v.rtype.unify(v_type):
-                    fail(f"Dict values must be homogenous, found {v_type} and {v.rtype}", node)
-            
-            return IRDictCtor(RustType(RustTypeKind.HASHMAP, inner=[k_type, v_type]), keys, vals)
-
-        elif isinstance(node, ast.Attribute):
-            instance_expr = self.visit_expr(node.value)
-            if instance_expr.rtype.kind == RustTypeKind.STRUCT:
-                field_type = self.symtab.get_struct_field_type(instance_expr.rtype.name, node.attr)
-                if not field_type:
-                    fail(f"Struct '{instance_expr.rtype.name}' has no field '{node.attr}'", node)
-                return IRFieldAccess(field_type, instance_expr, node.attr) # pyright: ignore[reportArgumentType]
-            fail(f"Cannot access attribute '{node.attr}' on type {instance_expr.rtype}", node)
-
-        elif isinstance(node, ast.JoinedStr):
-            return self.visit_fstring(node)
-
-        fail(f"Unsupported expression type: {type(node).__name__}", node)
-
-    def visit_call(self, node: ast.Call) -> IRExpr: # pyright: ignore[reportReturnType]
-        func_node = node.func
-        args_exprs = [self.visit_expr(a) for a in node.args]
-
-        # Method call (e.g., obj.method())
-        if isinstance(func_node, ast.Attribute):
-            instance_expr = self.visit_expr(func_node.value)
-            method_name = func_node.attr
-
-            # Built-in collection methods
-            if instance_expr.rtype.kind == RustTypeKind.VEC:
-                if method_name == 'append':
-                    if len(args_exprs) != 1:
-                        fail("Vec.append() takes exactly one argument", node)
-                    # Use the inner type of the Vec for the argument type check
-                    if not args_exprs[0].rtype.unify(instance_expr.rtype.inner[0]):
-                        fail(f"Argument type mismatch for Vec.append(): expected {instance_expr.rtype.inner[0]}, got {args_exprs[0].rtype}", node)
-                    return IRCall(RustType(RustTypeKind.UNIT), "push", args_exprs, True, instance_expr)
-                if method_name == 'pop':
-                    if len(args_exprs) != 0:
-                        fail("Vec.pop() takes no arguments", node)
-                    return IRCall(RustType(RustTypeKind.OPTION, inner=instance_expr.rtype.inner), "pop", args_exprs, True, instance_expr)
-                fail(f"Unsupported Vec method: {method_name}", node)
-
-            elif instance_expr.rtype.kind == RustTypeKind.HASHMAP:
-                if method_name == 'get':
-                    if len(args_exprs) != 1:
-                        fail("HashMap.get() takes exactly one argument", node)
-                    # Check key type matches
-                    key_type_of_map = instance_expr.rtype.inner[0]
-                    if not args_exprs[0].rtype.unify(key_type_of_map):
-                        fail(f"Dict key type mismatch for .get(): expected {key_type_of_map}, got {args_exprs[0].rtype}", node)
-                    ret_type = RustType(RustTypeKind.OPTION, inner=[instance_expr.rtype.inner[1]])
-                    return IRCall(ret_type, "get", args_exprs, True, instance_expr)
-                fail(f"Unsupported HashMap method: {method_name}", node)
-
-            # User-defined methods on structs
-            if instance_expr.rtype.kind == RustTypeKind.STRUCT:
-                struct_name = instance_expr.rtype.name
-                sig = self.symtab.get_method_sig(struct_name, method_name)
+                    return IRCall(RustType(RustTypeKind.STRING), rm, ae, True, inst)
+            if inst.rtype.kind == RustTypeKind.STRUCT:
+                # Handle struct method calls
+                sn = inst.rtype.name
+                sig = self.symtab.get_method_sig(sn, mn)
                 if sig:
-                    expected_arg_types, ret_type = sig
-                    if len(args_exprs) != len(expected_arg_types):
-                        fail(f"Method '{struct_name}.{method_name}' expects {len(expected_arg_types)} arguments, got {len(args_exprs)}", node)
-                    for i, (arg_expr, expected_type) in enumerate(zip(args_exprs, expected_arg_types)):
-                        if not arg_expr.rtype.unify(expected_type):
-                            fail(f"Argument {i+1} type mismatch for method '{struct_name}.{method_name}': expected {expected_type}, got {arg_expr.rtype}", node)
-                    return IRCall(ret_type, method_name, args_exprs, True, instance_expr)
-                fail(f"Struct '{struct_name}' has no method '{method_name}'", node)
-            
-            fail(f"Cannot call method '{method_name}' on type {instance_expr.rtype}", node)
-
-        # Function call (e.g., func())
-        elif isinstance(func_node, ast.Name):
-            fname = func_node.id
-
-            # Built-in functions
-            if fname == 'print':
-                # `print` in Python transpiles to `println!` which has flexible arguments
-                # We'll keep it as `println!` with all IR exprs as args, emitter handles formatting.
-                return IRCall(RustType(RustTypeKind.UNIT), "println!", args_exprs)
-            
-            if fname == 'len':
-                if len(args_exprs) != 1:
-                    fail("len() takes exactly one argument", node)
-                # Check if the type has a 'len' concept (Vec, String, HashMap)
-                arg_rtype = args_exprs[0].rtype
-                if arg_rtype.kind not in {RustTypeKind.VEC, RustTypeKind.STRING, RustTypeKind.HASHMAP}:
-                    fail(f"len() not supported for type {arg_rtype}", node)
-                return IRCall(RustType(RustTypeKind.I64), "len", args_exprs, True, args_exprs[0])
-            
-            if fname == 'str':
-                if len(args_exprs) != 1:
-                    fail("str() takes exactly one argument", node)
-                # Any type can generally be converted to a string using .to_string()
-                return IRCall(RustType(RustTypeKind.STRING), "to_string", args_exprs, True, args_exprs[0])
-            
-            if fname == 'int':
-                if len(args_exprs) != 1:
-                    fail("int() takes exactly one argument", node)
-                # Convert string/float to int. Assume parse() for strings, cast for floats.
-                if args_exprs[0].rtype.kind == RustTypeKind.STRING:
-                    # String::parse() returns Result<T, E>, need unwrap_or_else or similar.
-                    # For simplicity, we assume successful parsing for now or handle with specific IR.
-                    # This could be improved to handle `Result` or `expect`.
-                    # For now, let's represent as a call that returns I64 (assuming parse() ultimately gives I64).
-                    return IRCall(RustType(RustTypeKind.I64), "parse", args_exprs, True, args_exprs[0])
-                elif args_exprs[0].rtype.kind == RustTypeKind.F64:
-                    return IRCall(RustType(RustTypeKind.I64), "as i64", args_exprs, True, args_exprs[0]) # Cast
+                    arg_types, ret_type = sig
+                    fail("Arg count", n) if len(ae) != len(arg_types) else None
+                    for i, (ae_i, et) in enumerate(zip(ae, arg_types)):
+                        fail("Arg type", n) if not ae_i.rtype.unify(et) else None
+                    return IRCall(ret_type, mn, ae, True, inst)
+                fail(f"No method {mn} on {sn}", n)
+            fail("Bad method", n)
+        if isinstance(fn, ast.Name):
+            fname = fn.id
+            if fname == "print":
+                return IRCall(RustType(RustTypeKind.UNIT), "println!", ae)
+            if fname == "len":
+                fail("len 1", n) if len(ae) != 1 else None
+                (
+                    fail("Bad type", n)
+                    if ae[0].rtype.kind
+                    not in {RustTypeKind.VEC, RustTypeKind.STRING, RustTypeKind.HASHMAP}
+                    else None
+                )
+                return IRCall(RustType(RustTypeKind.I64), "len", ae, True, ae[0])
+            if fname == "str":
+                fail("str 1", n) if len(ae) != 1 else None
+                return IRCall(
+                    RustType(RustTypeKind.STRING), "to_string", ae, True, ae[0]
+                )
+            if fname == "int":
+                fail("int 1", n) if len(ae) != 1 else None
+                if ae[0].rtype.kind == RustTypeKind.STRING:
+                    return IRCall(RustType(RustTypeKind.I64), "parse", ae, True, ae[0])
+                if ae[0].rtype.kind == RustTypeKind.F64:
+                    return IRCall(RustType(RustTypeKind.I64), "as_i64", ae, True, ae[0])
+                fail("Bad int", n)
+            if fname == "float":
+                fail("float 1", n) if len(ae) != 1 else None
+                if ae[0].rtype.kind == RustTypeKind.STRING:
+                    return IRCall(RustType(RustTypeKind.F64), "parse", ae, True, ae[0])
+                if ae[0].rtype.kind == RustTypeKind.I64:
+                    return IRCall(RustType(RustTypeKind.F64), "as_f64", ae, True, ae[0])
+                fail("Bad float", n)
+            if fname == "input":
+                if len(ae) == 0:
+                    return IRCall(
+                        RustType(RustTypeKind.STRING),
+                        "__read_input",
+                        [
+                            IRLiteral(
+                                RustType(RustTypeKind.STRING),
+                                '""',
+                                is_input_prompt=True,
+                            )
+                        ],
+                    )
+                if len(ae) == 1:
+                    arg = ae[0]
+                    if (
+                        isinstance(arg, IRLiteral)
+                        and arg.rtype.kind == RustTypeKind.STRING
+                    ):
+                        arg.is_input_prompt = True
+                    return IRCall(RustType(RustTypeKind.STRING), "__read_input", [arg])
+                fail("input takes 0 or 1 args", n)
+            if fname == "range":
+                fail("range args", n) if not ae else None
+                if len(ae) == 1:
+                    se, ee = IRLiteral(RustType(RustTypeKind.I64), "0"), ae[0]
+                elif len(ae) == 2:
+                    se, ee = ae[0], ae[1]
                 else:
-                    fail(f"int() conversion not supported for type {args_exprs[0].rtype}", node)
-
-            if fname == 'float':
-                if len(args_exprs) != 1:
-                    fail("float() takes exactly one argument", node)
-                if args_exprs[0].rtype.kind == RustTypeKind.STRING:
-                    return IRCall(RustType(RustTypeKind.F64), "parse", args_exprs, True, args_exprs[0])
-                elif args_exprs[0].rtype.kind == RustTypeKind.I64:
-                    return IRCall(RustType(RustTypeKind.F64), "as f64", args_exprs, True, args_exprs[0]) # Cast
-                else:
-                    fail(f"float() conversion not supported for type {args_exprs[0].rtype}", node)
-
-            if fname == 'range':
-                if not args_exprs:
-                    fail("range() needs at least one argument", node)
-                
-                start_expr: IRExpr
-                end_expr: IRExpr
-                
-                if len(args_exprs) == 1:
-                    start_expr = IRLiteral(RustType(RustTypeKind.I64), "0")
-                    end_expr = args_exprs[0]
-                elif len(args_exprs) == 2:
-                    start_expr = args_exprs[0]
-                    end_expr = args_exprs[1]
-                elif len(args_exprs) == 3:
-                    # step = args_exprs[2] — not supported yet in current IR for Rust ranges
-                    fail("range(start, end, step) with step argument is not yet fully supported", node)
-                else:
-                    fail("range() takes 1 or 2 arguments", node)
-                
-                if not (start_expr.rtype.kind == RustTypeKind.I64 and end_expr.rtype.kind == RustTypeKind.I64):
-                    fail("range() arguments must be of type int", node)
-                
-                return IRRangeCtor(RustType(RustTypeKind.RANGE), start_expr, end_expr, exclusive=True)
-
-            # Struct constructor (e.g., Person())
+                    fail("range step", n)
+                (
+                    fail("int range", n)
+                    if not (
+                        se.rtype.kind == RustTypeKind.I64
+                        and ee.rtype.kind == RustTypeKind.I64
+                    )
+                    else None
+                )
+                return IRRangeCtor(RustType(RustTypeKind.RANGE), se, ee, exclusive=True)
             if fname in self.symtab.struct_defs:
-                # Python allows Person() or Person(field=val, ...)
-                if not node.keywords and not args_exprs:
-                    # Empty constructor call, map to Rust's Default trait for structs
-                    return IRStructCtor(RustType(RustTypeKind.STRUCT, name=fname), fname, [])
-                
-                # If there are arguments or keywords, it's treated as a constructor with fields
-                # This compiler currently assumes direct mapping for `Person(arg1, arg2)` to `Person { field1: arg1, field2: arg2 }`
-                # or `Person(field1=arg1)` to `Person { field1: arg1 }`. This needs to match struct field order/names.
-                
-                # For simplicity here, we assume it's like a function call where args match struct fields by order
-                # This is a simplification and might require more robust mapping if Python args don't strictly match Rust fields
-                fields_from_args: List[Tuple[str, IRExpr]] = []
-                struct_fields_def = self.symtab.struct_defs[fname]
-                
-                if len(args_exprs) > len(struct_fields_def):
-                    fail(f"Too many positional arguments for struct '{fname}' constructor. Expected at most {len(struct_fields_def)}", node)
-
-                # Process positional arguments
-                for i, (field_name, field_type) in enumerate(struct_fields_def.items()):
-                    if i < len(args_exprs):
-                        arg_expr = args_exprs[i]
-                        if not arg_expr.rtype.unify(field_type):
-                            fail(f"Positional argument {i+1} type mismatch for field '{field_name}' in struct '{fname}': expected {field_type}, got {arg_expr.rtype}", node)
-                        fields_from_args.append((field_name, arg_expr))
-                    else:
-                        break # No more positional args
-
-                # Process keyword arguments (FIXME: this part isn't fully robust as it doesn't merge with positional)
-                for keyword in node.keywords:
-                    kw_field_name = keyword.arg
-                    kw_value_expr = self.visit_expr(keyword.value)
-                    
-                    if kw_field_name is None: # Should not happen with keyword.arg
-                        fail("Keyword argument name is missing", node)
-
-                    expected_field_type = struct_fields_def.get(kw_field_name) # pyright: ignore[reportArgumentType]
-                    if not expected_field_type:
-                        fail(f"Struct '{fname}' has no field named '{kw_field_name}'", node)
-                    
-                    if not kw_value_expr.rtype.unify(expected_field_type): # pyright: ignore[reportArgumentType]
-                        fail(f"Keyword argument '{kw_field_name}' type mismatch for struct '{fname}': expected {expected_field_type}, got {kw_value_expr.rtype}", node)
-                    
-                    # Prevent duplicate field assignments (positional + keyword)
-                    if any(f[0] == kw_field_name for f in fields_from_args):
-                        fail(f"Field '{kw_field_name}' assigned multiple times in struct '{fname}' constructor", node)
-                    
-                    fields_from_args.append((kw_field_name, kw_value_expr)) # pyright: ignore[reportArgumentType]
-                
-                return IRStructCtor(RustType(RustTypeKind.STRUCT, name=fname), fname, fields_from_args)
-
-            # User-defined global function
-            sig = self.symtab.func_sigs.get(fname)
+                ffa: list[tuple[str, IRExpr]] = []
+                sfd = self.symtab.struct_defs[fname]
+                fail("Many args", n) if len(ae) > len(sfd) else None
+                for i, (fn, ft) in enumerate(sfd.items()):
+                    if i < len(ae):
+                        ae_i = ae[i]
+                        fail("Type bad", n) if not ae_i.rtype.unify(ft) else None
+                        ffa.append((fn, ae_i))
+                for kw in n.keywords:
+                    kwfn = kw.arg
+                    fail("No name", n) if not kwfn else None
+                    kwe = self.visit_expr(kw.value)
+                    eft = sfd.get(kwfn)
+                    fail("No field", n) if not eft else None
+                    fail("Type bad", n) if not kwe.rtype.unify(eft) else None
+                    if any(f[0] == kwfn for f in ffa):
+                        fail("Dup field", n)
+                    ffa.append((kwfn, kwe))
+                return IRStructCtor(
+                    RustType(RustTypeKind.STRUCT, name=fname), fname, ffa
+                )
+            sig = (
+                self.symtab.func_sigs.get(fname)
+                if hasattr(self.symtab, "func_sigs")
+                else None
+            )
             if sig:
-                expected_arg_types, ret_type = sig
-                if len(args_exprs) != len(expected_arg_types):
-                    fail(f"Function '{fname}' expects {len(expected_arg_types)} arguments, got {len(args_exprs)}", node)
-                for i, (arg_expr, expected_type) in enumerate(zip(args_exprs, expected_arg_types)):
-                    if not arg_expr.rtype.unify(expected_type):
-                        fail(f"Argument {i+1} type mismatch for function '{fname}': expected {expected_type}, got {arg_expr.rtype}", node)
-                return IRCall(ret_type, fname, args_exprs)
+                eat, ret = sig
+                fail("Arg count", n) if len(ae) != len(eat) else None
+                for i, (ae_i, et) in enumerate(zip(ae, eat)):
+                    fail("Arg type", n) if not ae_i.rtype.unify(et) else None
+                return IRCall(ret, fname, ae)
+            fail(f"Unknown function {fname}", n)
+        fail("Bad call", n)
 
-            fail(f"Unknown function or constructor '{fname}'", node)
-
-        fail(f"Invalid call expression target: {type(func_node).__name__}", node)
-
-    def visit_fstring(self, node: ast.JoinedStr) -> IRExpr:
-        """f"text {expr}" → format!("text {}", expr)"""
-        fmt_str_parts: List[str] = []
-        fmt_args: List[IRExpr] = []
-
-        for part in node.values:
-            if isinstance(part, ast.Constant):
-                # Ensure the constant value is a string before processing
-                if not isinstance(part.value, str):
-                    fail(f"F-string constant part must be a string, got {type(part.value)}", part)
-                fmt_str_parts.append(part.value.replace("{", "{{").replace("}", "}}")) # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue, reportArgumentType]
-            elif isinstance(part, ast.FormattedValue):
-                fmt_str_parts.append("{}")
-                fmt_args.append(self.visit_expr(part.value))
+    def visit_fstr(self, n: ast.JoinedStr) -> IRExpr:
+        fsp: list[str] = []
+        fa: list[IRExpr] = []
+        for p in n.values:
+            if isinstance(p, ast.Constant):
+                fail("Not str", p) if not isinstance(p.value, str) else None
+                fsp.append(p.value.replace("{", "{{").replace("}", "}}"))
+            elif isinstance(p, ast.FormattedValue):
+                fsp.append("{}")
+                fa.append(self.visit_expr(p.value))
             else:
-                fail(f"Unsupported f-string part type: {type(part).__name__}", part)
-        
-        final_fmt_str = "".join(fmt_str_parts)
+                fail("Bad f-str", p)
+        return IRFString(RustType(RustTypeKind.STRING), "".join(fsp), fa)
 
-        # Create a special IR node for f-strings that preserves the raw string
-        return IRFString(RustType(RustTypeKind.STRING), final_fmt_str, fmt_args)
-
-    def visit_stmt(self, node: ast.stmt) -> List[IRStmt]: # pyright: ignore[reportReturnType]
-        if isinstance(node, ast.AnnAssign):
-            if not isinstance(node.target, ast.Name):
-                fail("Only simple variable assignments with annotations are supported", node.target)
-            
-            name = node.target.id # pyright: ignore[reportAttributeAccessIssue]
-            declared_type = self.parse_annotation(node.annotation)
-
-            init_expr: Optional[IRExpr] = None
-            if node.value:
-                init_expr = self.visit_expr(node.value)
-                if not init_expr.rtype.unify(declared_type):
-                    fail(f"Initialization type mismatch for '{name}': expected {declared_type}, got {init_expr.rtype}", node)
-
-            # AnnAssign implies declaration, so it's always 'let mut' in Rust if there's an assignment.
-            # If no initial value, it's just 'let mut x: Type;'
-            self.symtab.declare(name, declared_type, is_mut=True)
-            return [IRVarDecl(name, declared_type, True, init_expr)]
-
-        elif isinstance(node, ast.Assign):
-            if len(node.targets) > 1:
-                fail("Multi-target assignment (e.g., a = b = c) unsupported", node)
-            
-            target = node.targets[0]
-            value_expr = self.visit_expr(node.value)
-
-            # Simple variable assignment: x = value
-            if isinstance(target, ast.Name):
-                name = target.id
-                sym = self.symtab.lookup(name)
-                if sym:
-                    # Reassignment to an existing variable
-                    if not value_expr.rtype.unify(sym.rtype):
-                        fail(f"Type change in reassignment for '{name}': expected {sym.rtype}, got {value_expr.rtype}", node)
-                    if not sym.is_mut:
-                        fail(f"Cannot reassign to immutable variable '{name}'. Declare as `let mut {name}`.", node)
-                    return [IRAssign(name, value_expr)]
+    def visit_stmt(self, n: ast.stmt) -> list[IRStmt]:
+        if isinstance(n, ast.AnnAssign):
+            fail("Not name", n.target) if not isinstance(n.target, ast.Name) else None
+            nm = n.target.id
+            dt = self.parse_anno(n.annotation)
+            ie: IRExpr | None = None
+            if n.value:
+                ie = self.visit_expr(n.value)
+                fail("Type bad", n) if not ie.rtype.unify(dt) else None
+            self.symtab.declare(nm, dt, is_mut=True)
+            return [IRVarDecl(nm, dt, True, ie)]
+        if isinstance(n, ast.Assign):
+            fail("Mul target", n) if len(n.targets) != 1 else None
+            tgt, ve = n.targets[0], self.visit_expr(n.value)
+            if isinstance(tgt, ast.Name):
+                nm = tgt.id
+                sy = self.symtab.lookup(nm)
+                if sy:
+                    fail("Type bad", n) if not ve.rtype.unify(sy.rtype) else None
+                    fail("Immut", n) if not sy.is_mut else None
+                    return [IRAssign(nm, ve)]
                 else:
-                    # First assignment, implicitly declare mutable
-                    self.symtab.declare(name, value_expr.rtype, is_mut=True)
-                    return [IRVarDecl(name, value_expr.rtype, True, value_expr)]
-            
-            # Field assignment: obj.field = value
-            elif isinstance(target, ast.Attribute):
-                obj_expr = self.visit_expr(target.value)
-                field_name = target.attr
-                
-                if obj_expr.rtype.kind != RustTypeKind.STRUCT:
-                    fail(f"Can only assign to fields of structs, not type {obj_expr.rtype}", node)
-                
-                field_type = self.symtab.get_struct_field_type(obj_expr.rtype.name, field_name)
-                if not field_type:
-                    fail(f"Struct '{obj_expr.rtype.name}' has no field '{field_name}'", node)
-                
-                if not value_expr.rtype.unify(field_type): # pyright: ignore[reportArgumentType] # pyright: ignore[reportArgumentType]
-                    fail(f"Field '{field_name}' type mismatch: expected {field_type}, got {value_expr.rtype}", node)
-                
-                # Ensure the instance itself is mutable to allow field assignment
-                if isinstance(obj_expr, IRVariable):
-                    obj_sym = self.symtab.lookup(obj_expr.name)
-                    if not obj_sym or not obj_sym.is_mut:
-                        fail(f"Cannot assign to field '{field_name}' of immutable struct instance '{obj_expr.name}'. Declare instance as `let mut {obj_expr.name}`.", node)
-
-                # Emit as a special assignment to field
-                # If target.value is an ast.Name (e.g., `my_struct.field`), use its ID.
-                # If target.value is `self` (within a method), use "self".
-                obj_identifier: str
-                if isinstance(target.value, ast.Name):
-                    obj_identifier = target.value.id
-                elif isinstance(target.value, ast.Attribute) and target.value.attr == 'self':
-                    obj_identifier = 'self' # This case is probably not reachable with current Python AST handling for `self.field` directly.
-                                            # It would be `obj.field` where `obj` is an `IRVariable` for `self`.
+                    self.symtab.declare(nm, ve.rtype, is_mut=True)
+                    return [IRVarDecl(nm, ve.rtype, True, ve)]
+            if isinstance(tgt, ast.Attribute):
+                oe = self.visit_expr(tgt.value)
+                fn = tgt.attr
+                fail("Not struct", n) if oe.rtype.kind != RustTypeKind.STRUCT else None
+                ft = self.symtab.get_struct_field_type(oe.rtype.name, fn)
+                fail("No field", n) if not ft else None
+                fail("Type bad", n) if not ve.rtype.unify(ft) else None
+                if isinstance(oe, IRVariable):
+                    os = self.symtab.lookup(oe.name)
+                    fail("Immut struct", n) if not os or not os.is_mut else None
+                if isinstance(oe, IRVariable):
+                    oi = oe.name
                 else:
-                    fail(f"Unsupported target for field assignment: {ast.dump(target.value)}", node)
-                
-                return [IRFieldAssign(obj_identifier, field_name, value_expr)]
-            
-            fail(f"Unsupported assignment target: {type(target).__name__}", node)
-
-        elif isinstance(node, ast.Expr):
-            expr = self.visit_expr(node.value)
-            return [IRExprStmt(expr)]
-
-        elif isinstance(node, ast.If):
-            cond_expr = self.visit_expr(node.test)
-            if cond_expr.rtype.kind != RustTypeKind.BOOL:
-                fail(f"If condition must be of type bool, got {cond_expr.rtype}", node)
-            
-            # Type merging logic for conditional branches (basic version)
-            # This is a complex area for full type flow analysis.
-            # For simplicity, we assume variables declared in branches
-            # are local to that branch unless they unify with an outer scope.
-            # And, for reassigned variables, we try to ensure type consistency.
-
-            # Store current symbol table state before the if block
-            original_scope_vars = {name: self.symtab.lookup(name) for name in self.symtab.scopes[-1]}
-
-            then_block_stmts = self.visit_block(node.body)
-            then_scope_vars = self.symtab.scopes[-1].copy() # Get state after then block
-            self.symtab.exit_scope() # Exit then_block's scope
-
-            else_block_stmts: Optional[List[IRStmt]] = None
-            else_scope_vars: Dict[str, SymbolInfo] = {}
-
-            if node.orelse:
-                self.symtab.enter_scope() # Enter a new scope for else_block
-                else_block_stmts = self.visit_block(node.orelse)
-                else_scope_vars = self.symtab.scopes[-1].copy() # Get state after else block
-                self.symtab.exit_scope() # Exit else_block's scope
-
-            # Re-enter the original scope
-            # Merge type information for variables that might have been reassigned in both branches
-            for var_name, original_sym_info in original_scope_vars.items():
-                then_sym = then_scope_vars.get(var_name)
-                else_sym = else_scope_vars.get(var_name)
-
-                if then_sym and else_sym:
-                    # Variable was in both branches: check if types unify
-                    if not then_sym.rtype.unify(else_sym.rtype):
-                        fail(f"Type mismatch for variable '{var_name}' across 'if/else' branches: '{then_sym.rtype}' vs '{else_sym.rtype}'", node)
-                    # If they unify, the type remains the same as before or the unified type
-                    # The symtab already points to the parent scope info which has the original type.
-                    # If a variable's mutability changed, we ensure it's propagated up.
-                    if then_sym.is_mut or else_sym.is_mut:
-                        if original_sym_info:
-                            original_sym_info.is_mut = True
-                        else: # Should not happen if original_scope_vars was based on self.symtab.scopes[-1]
-                            self.symtab.declare(var_name, then_sym.rtype, is_mut=True)
-
-                elif then_sym and not else_sym:
-                    # Variable declared/reassigned only in 'then' branch. It's local to 'then'.
-                    pass
-                elif not then_sym and else_sym:
-                    # Variable declared/reassigned only in 'else' branch. It's local to 'else'.
-                    pass
-            
-            return [IRIf(cond_expr, then_block_stmts, else_block_stmts)]
-
-        elif isinstance(node, ast.While):
-            cond_expr = self.visit_expr(node.test)
-            if cond_expr.rtype.kind != RustTypeKind.BOOL:
-                fail(f"While condition must be of type bool, got {cond_expr.rtype}", node)
-            body_stmts = self.visit_block(node.body)
-            return [IRWhile(cond_expr, body_stmts)]
-
-        elif isinstance(node, ast.For):
-            if not isinstance(node.target, ast.Name):
-                fail("Complex for loop targets (e.g., tuple unpacking) unsupported", node.target)
-            
-            target_name = node.target.id # pyright: ignore[reportAttributeAccessIssue]
-            iterator_expr = self.visit_expr(node.iter)
-
-            # Infer loop variable type based on iterator
-            loop_var_type: Optional[RustType] = None
-            if iterator_expr.rtype.kind == RustTypeKind.VEC:
-                if not iterator_expr.rtype.inner:
-                    fail(f"Cannot iterate over an empty Vec type (missing inner type)", node.iter)
-                loop_var_type = iterator_expr.rtype.inner[0]
-            elif iterator_expr.rtype.kind == RustTypeKind.RANGE:
-                loop_var_type = RustType(RustTypeKind.I64) # Range yields i64
-            else:
-                fail(f"Cannot iterate over type {iterator_expr.rtype}", node.iter)
-
-            if loop_var_type is None: # Should be caught by the above, but for safety
-                fail(f"Failed to infer loop variable type for iterator {iterator_expr.rtype}", node.iter)
-
+                    oi = "self"
+                return [IRFieldAssign(oi, fn, ve)]
+            fail("Bad assign", n)
+        if isinstance(n, ast.Expr):
+            return [IRExprStmt(self.visit_expr(n.value))]
+        if isinstance(n, ast.If):
+            ce = self.visit_expr(n.test)
+            fail("Bool cond", n) if ce.rtype.kind != RustTypeKind.BOOL else None
             self.symtab.enter_scope()
-            self.symtab.declare(target_name, loop_var_type, is_mut=False) # pyright: ignore[reportArgumentType] # Loop variable is immutable by default
-            body_stmts = self.visit_block(node.body)
+            tb = self.visit_block(n.body)
             self.symtab.exit_scope()
-
-            return [IRFor(target_name, iterator_expr, body_stmts)]
-
-        elif isinstance(node, ast.Return):
-            val_expr: Optional[IRExpr] = None
-            if node.value:
-                val_expr = self.visit_expr(node.value)
-                if not val_expr.rtype.unify(self.current_func_ret_type):
-                    fail(f"Return type mismatch: expected {self.current_func_ret_type}, got {val_expr.rtype}", node)
-            elif self.current_func_ret_type.kind != RustTypeKind.UNIT:
-                fail(f"Function expects return type {self.current_func_ret_type}, but returned nothing.", node)
-            return [IRReturn(val_expr)]
-
-        elif isinstance(node, ast.Pass):
-            return [] # Pass statement translates to nothing
-
-        fail(f"Unsupported statement type: {type(node).__name__}", node)
-
-    def visit_block(self, stmts: List[ast.stmt]) -> List[IRStmt]:
-        self.symtab.enter_scope()
-        ir_stmts = []
-        for s in stmts:
-            ir_stmts.extend(self.visit_stmt(s))
-        self.symtab.exit_scope()
-        return ir_stmts
-
-    # ========== TWO-PASS COMPILATION ==========
-
-    def scan_declarations(self, tree: ast.Module):
-        """PASS 1: Collect struct & function signatures"""
-        for node in tree.body:
-            if isinstance(node, ast.ClassDef):
-                # Register struct fields
-                fields: Dict[str, RustType] = {}
-                for item in node.body:
-                    if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
-                        try:
-                            fields[item.target.id] = self.parse_annotation(item.annotation)
-                        except SystemExit: # Catch custom fail()
-                            fail(f"Cannot parse type for struct field {item.target.id}", item)
-                self.symtab.register_struct(node.name, fields)
-
-                # Register methods
-                for item in node.body:
-                    if isinstance(item, ast.FunctionDef):
-                        arg_types: List[RustType] = []
-                        # Skip 'self' argument for type signature
-                        for arg in item.args.args:
-                            if arg.arg != 'self':
-                                try:
-                                    arg_types.append(self.parse_annotation(arg.annotation))
-                                except SystemExit:
-                                    fail(f"Cannot parse type for method argument '{arg.arg}' in '{item.name}'", arg)
-                        
-                        ret_type = RustType(RustTypeKind.UNIT)
-                        if item.returns:
-                            try:
-                                ret_type = self.parse_annotation(item.returns)
-                            except SystemExit:
-                                fail(f"Cannot parse return type for method '{item.name}'", item)
-                        
-                        self.symtab.register_method(node.name, item.name, arg_types, ret_type)
-
-            elif isinstance(node, ast.FunctionDef):
-                arg_types: List[RustType] = []
-                for arg in node.args.args:
-                    try:
-                        arg_types.append(self.parse_annotation(arg.annotation))
-                    except SystemExit:
-                        fail(f"Cannot parse type for function argument '{arg.arg}' in '{node.name}'", arg)
-                
-                ret_type = RustType(RustTypeKind.UNIT)
-                if node.returns:
-                    try:
-                        ret_type = self.parse_annotation(node.returns)
-                    except SystemExit:
-                        fail(f"Cannot parse return type for function '{node.name}'", node)
-                
-                self.symtab.func_sigs[node.name] = (arg_types, ret_type)
-            # Other top-level statements are handled in the second pass for the main block.
-
-    def compile_module(self, tree: ast.Module) -> IRModule:
-        self.scan_declarations(tree) # First pass
-
-        structs: List[IRStructDecl] = []
-        funcs: List[IRFuncDecl] = []
-        main_stmts: List[IRStmt] = []
-
-        for node in tree.body:
-            if isinstance(node, ast.ClassDef):
-                fields = [(n, t) for n, t in self.symtab.struct_defs[node.name].items()]
-                structs.append(IRStructDecl(node.name, fields))
-
-                # Compile methods within the struct's impl block
-                for item in node.body:
-                    if isinstance(item, ast.FunctionDef):
-                        # Get return type from pre-scanned method signatures
-                        sig = self.symtab.get_method_sig(node.name, item.name)
-                        if sig:
-                            _, self.current_func_ret_type = sig
-                        else:
-                            self.current_func_ret_type = RustType(RustTypeKind.UNIT) # Should not happen if scan_declarations is correct
-
-                        self.symtab.enter_scope()
-                        
-                        args: List[Tuple[str, RustType]] = []
-                        for arg in item.args.args:
-                            if arg.arg == 'self':
-                                self.symtab.declare('self', RustType(RustTypeKind.STRUCT, name=node.name))
-                            else:
-                                t = self.parse_annotation(arg.annotation)
-                                self.symtab.declare(arg.arg, t, is_mut=False, is_arg=True)
-                                args.append((arg.arg, t))
-                        
-                        body_ir = self.visit_block(item.body)
-                        self.symtab.exit_scope()
-
-                        funcs.append(IRFuncDecl(
-                            item.name, args, self.current_func_ret_type, body_ir,
-                            is_method=True, self_type=RustType(RustTypeKind.STRUCT, name=node.name)
-                        ))
-
-            elif isinstance(node, ast.FunctionDef):
-                # Get return type from pre-scanned function signatures
-                sig = self.symtab.func_sigs.get(node.name)
-                if sig:
-                    _, self.current_func_ret_type = sig
-                else:
-                    self.current_func_ret_type = RustType(RustTypeKind.UNIT) # Should not happen
-
+            eb: list[IRStmt] | None = None
+            if n.orelse:
                 self.symtab.enter_scope()
-                
-                args: List[Tuple[str, RustType]] = []
-                for arg in node.args.args:
-                    t = self.parse_annotation(arg.annotation)
-                    self.symtab.declare(arg.arg, t, is_mut=False, is_arg=True)
-                    args.append((arg.arg, t))
-                
-                body_ir = self.visit_block(node.body)
+                eb = self.visit_block(n.orelse)
                 self.symtab.exit_scope()
+            return [IRIf(ce, tb, eb)]
+        if isinstance(n, ast.While):
+            ce = self.visit_expr(n.test)
+            fail("Bool cond", n) if ce.rtype.kind != RustTypeKind.BOOL else None
+            self.symtab.enter_scope()
+            body = self.visit_block(n.body)
+            self.symtab.exit_scope()
+            return [IRWhile(ce, body)]
+        if isinstance(n, ast.For):
+            (
+                fail("Complex for", n.target)
+                if not isinstance(n.target, ast.Name)
+                else None
+            )
+            tn = n.target.id
+            ite = self.visit_expr(n.iter)
+            lvt: RustType | None = (
+                ite.rtype.inner[0]
+                if ite.rtype.kind == RustTypeKind.VEC
+                else (
+                    RustType(RustTypeKind.I64)
+                    if ite.rtype.kind == RustTypeKind.RANGE
+                    else fail("Bad iter", n.iter)
+                )
+            )
+            self.symtab.enter_scope()
+            self.symtab.declare(tn, lvt, is_mut=False)
+            body = self.visit_block(n.body)
+            self.symtab.exit_scope()
+            return [IRFor(tn, ite, body)]
+        if isinstance(n, ast.Return):
+            ve: IRExpr | None = None
+            if n.value:
+                ve = self.visit_expr(n.value)
+                (
+                    fail("Type bad", n)
+                    if not ve.rtype.unify(self.current_func_ret_type)
+                    else None
+                )
+            elif self.current_func_ret_type.kind not in (
+                RustTypeKind.UNIT,
+                RustTypeKind.VOID,
+            ):
+                fail("Return bad", n)
+            return [IRReturn(ve)]
+        if isinstance(n, ast.Pass):
+            return []
+        fail("Bad stmt", n)
 
-                funcs.append(IRFuncDecl(node.name, args, self.current_func_ret_type, body_ir))
+    def visit_block(self, stmts: list[ast.stmt]) -> list[IRStmt]:
+        self.symtab.enter_scope()
+        ir = []
+        [ir.extend(self.visit_stmt(s)) for s in stmts]
+        self.symtab.exit_scope()
+        return ir
 
+    def scan_decl(self, tree: ast.Module) -> None:
+        for n in tree.body:
+            if isinstance(n, ast.ClassDef):
+                flds: dict[str, RustType] = {}
+                for it in n.body:
+                    if isinstance(it, ast.AnnAssign) and isinstance(
+                        it.target, ast.Name
+                    ):
+                        flds[it.target.id] = self.parse_anno(it.annotation)
+                self.symtab.register_struct(n.name, flds)
+                for it in n.body:
+                    if isinstance(it, ast.FunctionDef):
+                        at: list[RustType] = [
+                            self.parse_anno(a.annotation)
+                            for a in it.args.args
+                            if a.arg != "self"
+                        ]
+                        rt = (
+                            self.parse_anno(it.returns)
+                            if it.returns
+                            else RustType(RustTypeKind.UNIT)
+                        )
+                        self.symtab.register_method(n.name, it.name, at, rt)
+            if isinstance(n, ast.FunctionDef):
+                at: list[RustType] = [
+                    self.parse_anno(a.annotation) for a in n.args.args
+                ]
+                rt = (
+                    self.parse_anno(n.returns)
+                    if n.returns
+                    else RustType(RustTypeKind.UNIT)
+                )
+                self.symtab.func_sigs = getattr(self.symtab, "func_sigs", {}) | {
+                    n.name: (at, rt)
+                }
+
+    def is_main_guard(self, n: ast.stmt) -> bool:
+        """Check if statement is: if __name__ == "__main__": ..."""
+        if not isinstance(n, ast.If):
+            return False
+        cond = n.test
+        if isinstance(cond, ast.Compare) and len(cond.ops) == 1:
+            left, op, right = cond.left, cond.ops[0], cond.comparators[0]
+            if isinstance(op, ast.Eq):
+                # Check __name__ == "__main__"
+                if (
+                    isinstance(left, ast.Name)
+                    and left.id == "__name__"
+                    and isinstance(right, ast.Constant)
+                    and right.value == "__main__"
+                ):
+                    return True
+                # Check "__main__" == __name__
+                if (
+                    isinstance(right, ast.Name)
+                    and right.id == "__name__"
+                    and isinstance(left, ast.Constant)
+                    and left.value == "__main__"
+                ):
+                    return True
+        return False
+
+    def compile(self, tree: ast.Module) -> IRModule:
+        self.scan_decl(tree)
+        st: list[IRStructDecl] = []
+        fn: list[IRFuncDecl] = []
+        mb: list[IRStmt] = []
+        for n in tree.body:
+            if isinstance(n, ast.ClassDef):
+                flds = [(nm, t) for nm, t in self.symtab.struct_defs[n.name].items()]
+                st.append(IRStructDecl(n.name, flds))
+                for it in n.body:
+                    if isinstance(it, ast.FunctionDef):
+                        sig = self.symtab.get_method_sig(n.name, it.name)
+                        self.current_func_ret_type = (
+                            sig[1] if sig else RustType(RustTypeKind.UNIT)
+                        )
+                        self.symtab.enter_scope()
+                        ar = []
+                        for a in it.args.args:
+                            if a.arg == "self":
+                                self.symtab.declare(
+                                    "self",
+                                    RustType(RustTypeKind.STRUCT, name=n.name),
+                                    is_mut=True,
+                                )
+                            else:
+                                t = self.parse_anno(a.annotation)
+                                self.symtab.declare(a.arg, t, is_mut=False, is_arg=True)
+                                ar.append((a.arg, t))
+                        bdy = self.visit_block(it.body)
+                        self.symtab.exit_scope()
+                        fn.append(
+                            IRFuncDecl(
+                                it.name,
+                                ar,
+                                self.current_func_ret_type,
+                                bdy,
+                                is_method=True,
+                                self_type=RustType(RustTypeKind.STRUCT, name=n.name),
+                            )
+                        )
+            elif isinstance(n, ast.FunctionDef):
+                sig = (
+                    self.symtab.func_sigs.get(n.name)
+                    if hasattr(self.symtab, "func_sigs")
+                    else None
+                )
+                self.current_func_ret_type = (
+                    sig[1] if sig else RustType(RustTypeKind.UNIT)
+                )
+                self.symtab.enter_scope()
+                ar = []
+                for a in n.args.args:
+                    t = self.parse_anno(a.annotation)
+                    self.symtab.declare(a.arg, t, is_mut=False, is_arg=True)
+                    ar.append((a.arg, t))
+                bdy = self.visit_block(n.body)
+                self.symtab.exit_scope()
+                fn.append(IRFuncDecl(n.name, ar, self.current_func_ret_type, bdy))
+            elif self.is_main_guard(n):
+                # Handle if __name__ == "__main__": by extracting body
+                if_node = cast(ast.If, n)
+                mb.extend(self.visit_block(if_node.body))
             else:
-                # Top-level statements become part of `main` function
-                # Reset current_func_ret_type for the main block context if needed (it's unit by default)
-                self.current_func_ret_type = RustType(RustTypeKind.UNIT)
-                main_stmts.extend(self.visit_stmt(node))
+                mb.extend(self.visit_stmt(n))
+        return IRModule(st, fn, mb)
 
-        return IRModule(structs, funcs, main_stmts)
 
-# ==============================================================================
-# 5. RUST CODE GENERATOR
-# ==============================================================================
-
-class RustEmitter:
+class Emitter:
     def __init__(self):
-        self.indent_level = 0
+        self.ind = 0
+        self.has_input = False  # Track if we need input helpers
 
-    def indent(self) -> str:
-        return "    " * self.indent_level
+    def i(self) -> str:
+        return "    " * self.ind
 
-    def emit_type(self, t: RustType) -> str:
+    def e_type(self, t: RustType) -> str:
         return str(t)
 
-    def emit_expr(self, expr: IRExpr) -> str:
-        if isinstance(expr, IRLiteral):
-            # Convert string literals to String::from(...)
-            if expr.rtype.kind == RustTypeKind.STRING:
-                return f"String::from({expr.value})"
-            return expr.value
+    def e_expr(self, e: IRExpr) -> str:
+        if isinstance(e, IRLiteral):
+            if e.rtype.kind == RustTypeKind.STRING:
+                # Detect if this literal is a prompt for __read_input
+                if getattr(e, "is_input_prompt", False):
+                    return e.value  # Emit as &str literal directly
+                return f"String::from({e.value})"
+            return e.value
+        if isinstance(e, IRVariable):
+            return e.name
+        if isinstance(e, IRBinaryOp):
+            return f"{self.e_expr(e.left)} {e.op} {self.e_expr(e.right)}"
+        if isinstance(e, IRUnaryOp):
+            return f"{e.op}{self.e_expr(e.operand)}"
+        if isinstance(e, IRCall):
+            ae = [self.e_expr(a) for a in e.args]
+            ja = ", ".join(ae)
+            if e.func_name == "println!":
+                return f'println!("{{}}", {ja})' if ae else "println!()"
+            if e.is_method and e.instance:
+                # Special handling for parse method - no arguments, with unwrap
+                if e.func_name == "parse":
+                    return f"{self.e_expr(e.instance)}.parse::<i64>().unwrap_or(0)"
+                return f"{self.e_expr(e.instance)}.{e.func_name}({ja})"
+            return f"{e.func_name}({ja})"
+        if isinstance(e, IRListCtor):
+            return f"vec![{', '.join([self.e_expr(x) for x in e.elements])}]"
+        if isinstance(e, IRDictCtor):
+            ps = [
+                f"({self.e_expr(k)}, {self.e_expr(v)})"
+                for k, v in zip(e.keys, e.values)
+            ]
+            return f"std::collections::HashMap::from([{', '.join(ps)}])"
+        if isinstance(e, IRStructCtor):
+            fs = [f"{n}: {self.e_expr(v)}" for n, v in e.fields]
+            return (
+                f"{e.struct_name} {{ {', '.join(fs)} }}"
+                if fs
+                else f"{e.struct_name}::default()"
+            )
+        if isinstance(e, IRFieldAccess):
+            return f"{self.e_expr(e.instance)}.{e.field}"
+        if isinstance(e, IRRangeCtor):
+            return f"{self.e_expr(e.start)}..{self.e_expr(e.end)}"
+        if isinstance(e, IRFString):
+            fa = [self.e_expr(a) for a in e.args]
+            return (
+                f'format!("{e.fmt_str}", {", ".join(fa)})'
+                if fa
+                else f'"{e.fmt_str}".to_string()'
+            )
+        if isinstance(e, IRIndexAccess):
+            return f"{self.e_expr(e.container)}[{self.e_expr(e.index)}]"
+        return "/*unknown*/"
 
-        if isinstance(expr, IRVariable):
-            return expr.name
-
-        if isinstance(expr, IRBinaryOp):
-            lhs = self.emit_expr(expr.left)
-            rhs = self.emit_expr(expr.right)
-            
-            # String concat is handled by IRCall with format!
-            # For other types, direct op is fine
-            return f"{lhs} {expr.op} {rhs}"
-
-        if isinstance(expr, IRUnaryOp):
-            operand = self.emit_expr(expr.operand)
-            # Special case for `parse().unwrap()` which comes from `int("string")` or `float("string")`
-            if expr.op == "parse" and operand.endswith(".to_string()"):
-                 # This is a bit hacky, directly manipulating emitted string. Better would be an IR node for parse+unwrap.
-                return f"({operand}).parse().unwrap()"
-            elif expr.op == "parse": # For simple variables trying to parse
-                return f"{operand}.parse().unwrap()"
-            return f"{expr.op}{operand}"
-
-        if isinstance(expr, IRCall):
-            args_str: List[str] = []
-            for arg_expr in expr.args:
-                val = self.emit_expr(arg_expr)
-                # Clone non-primitives (except ranges for now) when passed to functions that take ownership
-                # or when we need to ensure the original is not consumed.
-                # This needs careful ownership analysis, but a blanket clone for non-primitives is a safer default.
-                if arg_expr.rtype.clone_needed():
-                    val = f"{val}.clone()"
-                args_str.append(val)
-
-            joined_args = ", ".join(args_str)
-
-            if expr.func_name == "format!":
-                # First argument of format! is the format string itself (literal)
-                if not args_str:
-                    return 'format!("")' # Empty format! call
-                
-                # The first arg is the format string itself.
-                # Assuming the first argument is always an IRLiteral of STRING or IRFString.
-                # We need to extract the raw format string without `String::from`
-                fmt_literal = cast(IRLiteral, expr.args[0])
-                actual_fmt_str = fmt_literal.value.strip('"') # Remove surrounding quotes
-                
-                # The remaining args are the expressions to format
-                remaining_args_str = ", ".join(args_str[1:])
-                return f'format!("{actual_fmt_str}", {remaining_args_str})'
-            
-            if expr.func_name == "println!":
-                # println! needs special handling for different arg types
-                if not expr.args:
-                    return f"println!()"
-                
-                # If the first argument is an IRFString, use its format directly.
-                if isinstance(expr.args[0], IRFString):
-                    fstring_expr = cast(IRFString, expr.args[0])
-                    # Ensure raw format string is used, and then its arguments
-                    return f'println!("{fstring_expr.fmt_str}", {", ".join([self.emit_expr(a) for a in fstring_expr.args])})'
-                
-                # If the first arg is a simple String literal (like println!("hello")), use it directly
-                if expr.args[0].rtype.kind == RustTypeKind.STRING and isinstance(expr.args[0], IRLiteral):
-                    # For a single String literal, println! takes it directly
-                    if len(expr.args) == 1:
-                        return f'println!({expr.args[0].value})'
-                    else: # If a String literal is followed by other args, it acts as a format string
-                        # e.g., println!("Hello {}", name)
-                        format_literal = cast(IRLiteral, expr.args[0])
-                        actual_fmt_str = format_literal.value.strip('"')
-                        remaining_args_str = ", ".join(args_str[1:])
-                        return f'println!("{actual_fmt_str}", {remaining_args_str})'
-
-                # Otherwise, assume display format for all arguments
-                format_placeholders = ", ".join(["{}" for _ in args_str])
-                return f'println!("{format_placeholders}", {joined_args})'
-
-            if expr.func_name == "to_string" and expr.is_method and expr.instance:
-                # `str(x)` becomes `x.to_string()`
-                inst_str = self.emit_expr(expr.instance)
-                return f"{inst_str}.to_string()"
-            
-            if (expr.func_name == "parse" or expr.func_name == "as i64" or expr.func_name == "as f64") and expr.is_method and expr.instance:
-                # `int(s)` becomes `s.parse().unwrap()` or `f as i64`
-                inst_str = self.emit_expr(expr.instance)
-                if expr.func_name == "parse":
-                    return f"{inst_str}.parse().unwrap()"
-                else: # "as i64" or "as f64"
-                    return f"{inst_str} {expr.func_name}"
-
-            if expr.is_method and expr.instance:
-                inst = self.emit_expr(expr.instance)
-                return f"{inst}.{expr.func_name}({joined_args})"
-
-            return f"{expr.func_name}({joined_args})"
-
-        if isinstance(expr, IRListCtor):
-            elems = ", ".join([self.emit_expr(e) for e in expr.elements])
-            return f"vec![{elems}]"
-
-        if isinstance(expr, IRDictCtor):
-            pairs = []
-            for k, v in zip(expr.keys, expr.values):
-                pairs.append(f"({self.emit_expr(k)}, {self.emit_expr(v)})")
-            return f"std::collections::HashMap::from([{', '.join(pairs)}])"
-
-        if isinstance(expr, IRStructCtor):
-            # Person() → Person { name: String::default(), age: 0, ... }
-            if not expr.fields:
-                # Empty constructor: use Default trait
-                return f"{expr.struct_name}::default()"
-            field_strs = [f"{name}: {self.emit_expr(val)}" for name, val in expr.fields]
-            return f"{expr.struct_name} {{ {', '.join(field_strs)} }}"
-
-        if isinstance(expr, IRFieldAccess):
-            return f"{self.emit_expr(expr.instance)}.{expr.field}"
-
-        if isinstance(expr, IRRangeCtor):
-            start = self.emit_expr(expr.start)
-            end = self.emit_expr(expr.end)
-            if expr.exclusive:
-                return f"{start}..{end}"
+    def e_stmt(self, s: IRStmt, in_init: bool = False) -> str:
+        ii = self.i()
+        if isinstance(s, IRVarDecl):
+            m = "mut " if s.is_mut else ""
+            ie = f" = {self.e_expr(s.init)}" if s.init else ""
+            return f"{ii}let {m}{s.name}: {self.e_type(s.rtype)}{ie};\n"
+        if isinstance(s, IRAssign):
+            return f"{ii}{s.target} = {self.e_expr(s.value)};\n"
+        if isinstance(s, IRFieldAssign):
+            # Skip field assignments in __init__ - they'll be in the struct literal
+            if in_init:
+                return ""
+            return f"{ii}{s.obj_name}.{s.field_name} = {self.e_expr(s.value)};\n"
+        if isinstance(s, IRExprStmt):
+            return f"{ii}{self.e_expr(s.expr)};\n"
+        if isinstance(s, IRReturn):
+            rv = f" {self.e_expr(s.value)}" if s.value else ""
+            return f"{ii}return{rv};\n"
+        if isinstance(s, IRIf):
+            r = f"{ii}if {self.e_expr(s.condition)} {{\n"
+            self.ind += 1
+            for st in s.then_block:
+                r += self.e_stmt(st, in_init=in_init)
+            self.ind -= 1
+            if s.else_block:
+                r += f"{ii}}} else {{\n"
+                self.ind += 1
+                for st in s.else_block:
+                    r += self.e_stmt(st, in_init=in_init)
+                self.ind -= 1
+                r += f"{ii}}}\n"
             else:
-                return f"{start}..={end}" # Rust supports inclusive ranges a..=b
+                r += f"{ii}}}\n"
+            return r
+        if isinstance(s, IRWhile):
+            r = f"{ii}while {self.e_expr(s.condition)} {{\n"
+            self.ind += 1
+            for st in s.body:
+                r += self.e_stmt(st)
+            self.ind -= 1
+            r += f"{ii}}}\n"
+            return r
+        if isinstance(s, IRFor):
+            iie = self.e_expr(s.iterator)
+            iie = (
+                f"&{iie}"
+                if isinstance(s.iterator, IRVariable)
+                and s.iterator.rtype.kind == RustTypeKind.VEC
+                else iie
+            )
+            r = f"{ii}for {s.target_name} in {iie} {{\n"
+            self.ind += 1
+            for st in s.body:
+                r += self.e_stmt(st)
+            self.ind -= 1
+            r += f"{ii}}}\n"
+            return r
+        return f"{ii}/*unknown stmt*/\n"
 
-        if isinstance(expr, IRFString):
-            args_emitted = [self.emit_expr(arg) for arg in expr.args]
-            args_str = ", ".join(args_emitted) # pyright: ignore[reportAssignmentType]
-            if args_emitted:
-                return f'format!("{expr.fmt_str}", {args_str})'
-            else:
-                return f'"{expr.fmt_str}".to_string()'
+    def emit(self, m: IRModule) -> str:
+        # Start with helper functions and imports
+        o = "#[allow(unused_imports)]\n"
+        o += "use std::collections::HashMap;\n"
+        o += "use std::io::{self, Write};\n\n"
 
-        return "/* unknown expr */"
-
-    def emit_stmt(self, stmt: IRStmt) -> str:
-        i = self.indent()
-
-        if isinstance(stmt, IRVarDecl):
-            mut = "mut " if stmt.is_mut else ""
-            if stmt.init:
-                init_expr = self.emit_expr(stmt.init)
-                return f"{i}let {mut}{stmt.name}: {self.emit_type(stmt.rtype)} = {init_expr};\n"
-            else:
-                # For `let mut x: Type;` without initialization
-                return f"{i}let {mut}{stmt.name}: {self.emit_type(stmt.rtype)};\n"
-
-        if isinstance(stmt, IRAssign):
-            # If the target is a variable that needs cloning on assignment (e.g., Vec, String)
-            # This is a simplification; Rust's move semantics are complex.
-            # For `x = y`, if y is owned, it moves. If x is also owned, then it needs a clone if y is used later.
-            # For basic transpilation, we might just assume moves.
-            # However, if `value` is an IRVariable of an owned type and `target` is a mutable variable,
-            # a clone might be required to avoid ownership issues if `value` is still used later.
-            # But, the type checker should enforce that `value` isn't used after being moved if not cloned.
-            # For now, we assume simple assignment for `IRAssign` handles `x = y` (move if owned, copy if primitive).
-            return f"{i}{stmt.target} = {self.emit_expr(stmt.value)};\n"
-
-        if isinstance(stmt, IRFieldAssign):
-            return f"{i}{stmt.obj_name}.{stmt.field_name} = {self.emit_expr(stmt.value)};\n"
-
-        if isinstance(stmt, IRExprStmt):
-            expr_str = self.emit_expr(stmt.expr)
-            # If the expression's return type is not Unit, it should be followed by a semicolon
-            # unless it's the last expression in a block (implicitly returned).
-            # For simplicity, we add semicolon to all expr statements.
-            return f"{i}{expr_str};\n"
-
-        if isinstance(stmt, IRReturn):
-            if stmt.value:
-                val = self.emit_expr(stmt.value)
-                return f"{i}return {val};\n"
-            return f"{i}return;\n"
-
-        if isinstance(stmt, IRIf):
-            cond = self.emit_expr(stmt.condition)
-            res = f"{i}if {cond} {{\n"
-            self.indent_level += 1
-            for s in stmt.then_block:
-                res += self.emit_stmt(s)
-            self.indent_level -= 1
-            
-            if stmt.else_block:
-                res += f"{i}}} else {{\n"
-                self.indent_level += 1
-                for s in stmt.else_block:
-                    res += self.emit_stmt(s)
-                self.indent_level -= 1
-                res += f"{i}}}\n"
-            else:
-                res += f"{i}}}\n"
-            return res
-
-        if isinstance(stmt, IRWhile):
-            cond = self.emit_expr(stmt.condition)
-            res = f"{i}while {cond} {{\n"
-            self.indent_level += 1
-            for s in stmt.body:
-                res += self.emit_stmt(s)
-            self.indent_level -= 1
-            res += f"{i}}}\n"
-            return res
-
-        if isinstance(stmt, IRFor):
-            target = stmt.target_name
-            iterator_expr_str = self.emit_expr(stmt.iterator)
-
-            # For iteration over Vecs or HashMaps, usually we iterate over references (`&vec` or `&map`)
-            # or mutable references (`&mut vec`). For Python-like iteration, `&` is common.
-            # If the original Python iterated over `list_var`, Rust will iterate over `&list_var`
-            # or `list_var.iter()` if not consuming.
-            # For `range`, it's already a range type, no need for `&`.
-            
-            # Simple heuristic: if it's a Vec variable, iterate over its reference
-            if isinstance(stmt.iterator, IRVariable) and stmt.iterator.rtype.kind == RustTypeKind.VEC:
-                iterator_expr_str = f"&{iterator_expr_str}"
-            elif isinstance(stmt.iterator, IRVariable) and stmt.iterator.rtype.kind == RustTypeKind.HASHMAP:
-                 # Iterate over `&map` to get `(&key, &value)` pairs
-                iterator_expr_str = f"&{iterator_expr_str}"
-
-            res = f"{i}for {target} in {iterator_expr_str} {{\n"
-            self.indent_level += 1
-            for s in stmt.body:
-                res += self.emit_stmt(s)
-            self.indent_level -= 1
-            res += f"{i}}}\n"
-            return res
-
-        return f"{i}/* unknown stmt type: {type(stmt).__name__} */\n"
-
-    def emit_module(self, module: IRModule) -> str:
-        out = ""
-        # Prelude
-        out += "#[allow(unused_imports)]\n"
-        out += "#[allow(unused_variables)]\n" # Allow unused for now, to reduce transpiler complexity
-        out += "#[allow(dead_code)]\n" # Allow dead code for functions not called from main
-        out += "use std::collections::{HashMap, HashSet};\n"
-        out += "use std::cmp::{min, max};\n\n"
-
-        # Structs
-        for s in module.structs:
-            out += f"#[derive(Debug, Clone, Default)]\n" # Add Default for empty constructors
-            out += f"struct {s.name} {{\n"
-            for field, ftype in s.fields:
-                out += f"{self.indent()}    pub {field}: {self.emit_type(ftype)},\n"
-            out += "}\n\n"
-
-        # Separate methods from global functions
-        methods_map: Dict[str, List[IRFuncDecl]] = {}
-        global_funcs: List[IRFuncDecl] = []
-
-        for f in module.funcs:
+        # Add input helper function
+        o += "fn __read_input(prompt: &str) -> String {\n"
+        o += '    print!("{}", prompt);\n'
+        o += "    io::stdout().flush().ok();\n"
+        o += "    let mut input = String::new();\n"
+        o += "    io::stdin().read_line(&mut input).ok();\n"
+        o += "    input.trim().to_string()\n"
+        o += "}\n\n"
+        for s in m.structs:
+            o += f"#[derive(Debug, Clone)]\nstruct {s.name} {{\n"
+            for fn, ft in s.fields:
+                o += f"    pub {fn}: {self.e_type(ft)},\n"
+            o += "}\n\n"
+        mtd: dict[str, list[IRFuncDecl]] = {}
+        for f in m.funcs:
             if f.is_method and f.self_type:
-                struct_name = f.self_type.name
-                if struct_name not in methods_map:
-                    methods_map[struct_name] = []
-                methods_map[struct_name].append(f)
+                sn = f.self_type.name
+                if sn not in mtd:
+                    mtd[sn] = []
+                mtd[sn].append(f)
             else:
-                global_funcs.append(f)
+                ret_sig = (
+                    f"-> {self.e_type(f.ret_type)}"
+                    if f.ret_type.kind not in (RustTypeKind.VOID, RustTypeKind.UNIT)
+                    else ""
+                )
+                o += f"fn {f.name}({', '.join([f'{n}: {self.e_type(t)}' for n,t in f.args])}) {ret_sig} {{\n"
+                self.ind += 1
+                for st in f.body:
+                    o += self.e_stmt(st)
+                self.ind -= 1
+                o += "}\n\n"
+        for sn, fs in mtd.items():
+            o += f"impl {sn} {{\n"
+            self.ind += 1
+            for f in fs:
+                ar = ", ".join([f"{n}: {self.e_type(t)}" for n, t in f.args])
+                ret_type = "Self" if f.name == "__init__" else self.e_type(f.ret_type)
+                ret_sig = (
+                    f" -> {ret_type}"
+                    if f.name == "__init__"
+                    or f.ret_type.kind not in (RustTypeKind.VOID, RustTypeKind.UNIT)
+                    else ""
+                )
+                fn_name = "new" if f.name == "__init__" else f.name
+                # __init__ (new) doesn't need &mut self, other methods do
+                self_param = "" if f.name == "__init__" else "&mut self"
+                o += f"    pub fn {fn_name}({self_param}{f', {ar}' if ar and self_param else f'{ar}' if ar else ''}){ret_sig} {{\n"
+                self.ind += 1
+                for st in f.body:
+                    in_init = f.name == "__init__"
+                    # In __init__, skip field assignments - they'll be in struct init
+                    if in_init and isinstance(st, IRFieldAssign):
+                        continue
+                    o += self.e_stmt(st, in_init=in_init)
+                # Add implicit return self for __init__ methods
+                if f.name == "__init__":
+                    # Emit Self { field: value, ... }
+                    # Extract field->value mappings from the body
+                    field_values = {}
+                    for st in f.body:
+                        if isinstance(st, IRFieldAssign):
+                            # This will be skipped in e_stmt, but we capture it here
+                            if st.obj_name == "self":
+                                # Get the parameter value
+                                if isinstance(st.value, IRVariable):
+                                    field_values[st.field_name] = st.value.name
+                                else:
+                                    # For complex expressions, we'd need to emit them
+                                    field_values[st.field_name] = self.e_expr(st.value)
 
-        # Impl blocks for methods
-        for struct_name, funcs in methods_map.items():
-            out += f"impl {struct_name} {{\n"
-            self.indent_level += 1
-            
-            for f in funcs:
-                args = []
-                # `self` argument needs special handling in Rust method signatures
-                # Assuming `self` means `&mut self` for Python methods that modify state
-                # If a method doesn't modify self, it could be `&self` or `self`.
-                # For simplicity, we default to `&mut self` for now.
-                # A more sophisticated analysis would determine mutability.
-                self_arg = "&mut self" # Default assumption for Python methods
+                    o += f"{self.i()}Self {{\n"
+                    self.ind += 1
+                    # Get struct field names from the module's structs
+                    if f.self_type:
+                        struct_name = f.self_type.name
+                        # Find the struct in the module
+                        struct_decl = None
+                        for s in m.structs:
+                            if s.name == struct_name:
+                                struct_decl = s
+                                break
+                        if struct_decl:
+                            # Use the actual field-value mappings from assignments
+                            for field_name, _ in struct_decl.fields:
+                                if field_name in field_values:
+                                    o += f"{self.i()}{field_name}: {field_values[field_name]},\n"
+                                else:
+                                    # If no assignment, use the param with same name
+                                    o += f"{self.i()}{field_name}: {field_name},\n"
+                    self.ind -= 1
+                    o += f"{self.i()}}}\n"
+                self.ind -= 1
+                o += "    }\n"
+            self.ind -= 1
+            o += "}\n\n"
+        o += "fn main() {\n"
+        self.ind += 1
+        for s in m.main_block:
+            o += self.e_stmt(s)
+        self.ind -= 1
+        o += "}\n"
+        return o
 
-                for name, type_ in f.args:
-                    args.append(f"{name}: {self.emit_type(type_)}")
 
-                # Construct the full method signature
-                sig = f"pub fn {f.name}({self_arg}"
-                if args:
-                    sig += ", " + ", ".join(args)
-                sig += ")"
+try:
+    import typer
 
-                if f.ret_type.kind != RustTypeKind.UNIT:
-                    sig += f" -> {self.emit_type(f.ret_type)}"
+    has_typer = True
+except ImportError:
+    has_typer = False
 
-                out += f"{self.indent()}{sig} {{\n"
-                self.indent_level += 1
-                for stmt in f.body:
-                    out += self.emit_stmt(stmt)
-                self.indent_level -= 1
-                out += f"{self.indent()}}}\n\n"
 
-            self.indent_level -= 1
-            out += "}\n\n"
+def compile_and_run(out_path: str, run: bool):
+    # delete any old PDBs in the same folder
+    for pdb_file in glob.glob(os.path.join(os.path.dirname(out_path), "*.pdb")):
+        try:
+            os.remove(pdb_file)
+        except Exception:
+            pass
 
-        # Global functions
-        for f in global_funcs:
-            args = ", ".join([f"{n}: {self.emit_type(t)}" for n, t in f.args])
-            sig = f"fn {f.name}({args})"
-            if f.ret_type.kind != RustTypeKind.UNIT:
-                sig += f" -> {self.emit_type(f.ret_type)}"
+    bin_out = out_path.replace(".rs", "")
+    if os.name == "nt":
+        bin_out += ".exe"
 
-            out += f"{sig} {{\n"
-            self.indent_level += 1
-            for stmt in f.body:
-                out += self.emit_stmt(stmt)
-            self.indent_level -= 1
-            out += "}\n\n"
+    rust_flags = ["-C", "link-arg=/DEBUG:NONE"] if os.name == "nt" else []
 
-        # Main function
-        out += "fn main() {\n"
-        self.indent_level += 1
-        for stmt in module.main_block:
-            out += self.emit_stmt(stmt)
-        self.indent_level -= 1
-        out += "}\n"
-
-        return out
-
-# ==============================================================================
-# 6. MAIN DRIVER
-# ==============================================================================
-
-app = typer.Typer()
-
-@app.command()
-def main(
-    input: str = typer.Argument(..., help="Input Python file"),
-    output: str = typer.Option(None, "--output", "-o", help="Output Rust file (default: <input>.rs)"),
-    no_compile: bool = typer.Option(False, "--no-compile", help="Only generate .rs file"),
-    keep_pdb: bool = typer.Option(False, "--keep-pdb", help="Keep .pdb debug symbols file (Windows only)"),
-    run: bool = typer.Option(False, "--run", help="Execute the compiled binary after compilation")
-):
+    print("[✓] Compiling with rustc...", file=sys.stderr)
     try:
-        with open(input, "r", encoding="utf-8") as f:
-            source = f.read()
-    except FileNotFoundError:
-        typer.echo(f"Error: File '{input}' not found.", err=True)
-        raise typer.Exit(1)
-    except Exception as e:
-        typer.echo(f"Error reading file '{input}': {e}", err=True)
-        raise typer.Exit(1)
+        r = subprocess.run(
+            ["rustc", out_path, "-o", bin_out] + rust_flags,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if r.returncode != 0:
+            print(f"[✗] Compilation failed:\n{r.stderr}", file=sys.stderr)
+            sys.exit(1)
+        print(f"[✓] Compiled: {bin_out}", file=sys.stderr)
+        if run:
+            print(f"[▶] Running {bin_out}...", file=sys.stderr)
+            subprocess.run([bin_out], check=True)
+    except subprocess.TimeoutExpired:
+        print("[✗] Compilation timeout", file=sys.stderr)
+        sys.exit(1)
+    except FileNotFoundError as e:
+        print(f"[✗] Could not run rustc or the binary: {e}", file=sys.stderr)
+        print(
+            "[💡] Make sure Rust is installed and rustc is in PATH: https://rustup.rs/",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
-    try:
-        tree = ast.parse(source, filename=input)
-    except SyntaxError as e:
-        typer.echo(f"Syntax Error in Python file: {e}", err=True)
-        raise typer.Exit(1)
 
-    compiler = PythonToRustCompiler()
+if has_typer:
+    app = typer.Typer()
 
-    try:
-        ir_module = compiler.compile_module(tree)
-        emitter = RustEmitter()
-        rust_code = emitter.emit_module(ir_module)
+    @app.command()
+    def main(
+        inp: str = typer.Argument(..., help="Input Python file"),
+        out: str = typer.Option(None, "--output", "-o", help="Output Rust file"),
+        no_comp: bool = typer.Option(False, "--no-compile", help="Skip compilation"),
+        run: bool = typer.Option(False, "--run", help="Execute after compile"),
+    ):
+        try:
+            with open(inp) as f:
+                src = f.read()
+        except Exception as e:
+            typer.echo(f"Error reading {inp}: {e}", err=True)
+            raise typer.Exit(1)
 
-        input_dir = os.path.dirname(os.path.abspath(input))
-        input_basename_no_ext = os.path.splitext(os.path.basename(input))[0]
+        try:
+            tree = ast.parse(src)
+        except SyntaxError as e:
+            typer.echo(f"Syntax error: {e}", err=True)
+            raise typer.Exit(1)
 
-        if output is None:
-            output_rs_path = os.path.join(input_dir, f"{input_basename_no_ext}.rs")
+        c = Compiler()
+        ir = c.compile(tree)
+        em = Emitter()
+        rust = em.emit(ir)
+
+        if out is None:
+            out = inp.replace(".py", ".rs")
+
+        with open(out, "w") as f:
+            f.write(rust)
+        typer.echo(f"[✓] Generated {out}", err=True)
+
+        if not no_comp:
+            compile_and_run(out, run)
         else:
-            output_rs_path = output if os.path.isabs(output) else os.path.join(input_dir, output)
+            typer.echo("[⊘] Compilation skipped", err=True)
 
-        with open(output_rs_path, 'w', encoding="utf-8") as f:
-            f.write(rust_code)
-        typer.echo(f"[STEP 1] Generated: {output_rs_path}", err=True)
+    if __name__ == "__main__":
+        app()
 
-        if not no_compile:
-            output_bin_name = input_basename_no_ext + ('.exe' if sys.platform == 'win32' else '')
-            output_bin_path = os.path.join(input_dir, output_bin_name)
+else:
+    if __name__ == "__main__":
+        if len(sys.argv) < 2:
+            print("Usage: p2r.py <input.py> [output.rs]", file=sys.stderr)
+            sys.exit(1)
 
-            typer.echo(f"[STEP 2] Compiling: rustc {output_rs_path} -o {output_bin_path}", err=True)
+        inp = sys.argv[1]
+        out = sys.argv[2] if len(sys.argv) > 2 else inp.replace(".py", ".rs")
 
-            result = subprocess.run(['rustc', output_rs_path, '-o', output_bin_path], capture_output=True, text=True, cwd=input_dir)
+        try:
+            with open(inp) as f:
+                src = f.read()
+        except Exception as e:
+            print(f"Error reading {inp}: {e}", file=sys.stderr)
+            sys.exit(1)
 
-            if result.returncode != 0:
-                typer.echo("[ERROR] Rust compilation failed:", err=True)
-                typer.echo(result.stdout, err=True)
-                typer.echo(result.stderr, err=True)
-                raise typer.Exit(1)
+        try:
+            tree = ast.parse(src)
+        except SyntaxError as e:
+            print(f"Syntax error: {e}", file=sys.stderr)
+            sys.exit(1)
 
-            typer.echo(f"[STEP 2] Compiled: {output_bin_path}", err=True)
+        c = Compiler()
+        ir = c.compile(tree)
+        em = Emitter()
+        rust = em.emit(ir)
 
-            if run:
-                typer.echo(f"[STEP 3] Running: {output_bin_path}", err=True)
-                run_result = subprocess.run([output_bin_path], cwd=input_dir)
-                if run_result.returncode != 0:
-                    typer.echo(f"[ERROR] Program exited with code: {run_result.returncode}", err=True)
-                    raise typer.Exit(1)
+        with open(out, "w") as f:
+            f.write(rust)
+        print(f"✓ Generated {out}", file=sys.stderr)
 
-            if not keep_pdb and sys.platform == 'win32':
-                pdb_file = os.path.join(input_dir, f"{input_basename_no_ext}.pdb")
-                if os.path.exists(pdb_file):
-                    try:
-                        os.remove(pdb_file)
-                        typer.echo(f"[CLEANUP] Removed: {pdb_file}", err=True)
-                    except Exception as e:
-                        typer.echo(f"[WARN] Could not remove {pdb_file}: {e}", err=True)
-        else:
-            typer.echo("[SKIP] Compilation skipped (--no-compile)", err=True)
-
-    except CompilerError:
-        raise typer.Exit(1)
-    except Exception as e:
-        typer.echo(f"\n[CRITICAL ERROR] {e}", err=True)
-        raise typer.Exit(1)
-
-if __name__ == "__main__":
-    app()
-    
+        compile_and_run(out, run=True)

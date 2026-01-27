@@ -4,9 +4,11 @@ print(f"x = {x}")
 y: int = x + 10
 print(y)
 
+
 # Test function
 def add(a: int, b: int) -> int:
     return a + b
+
 
 result: int = add(5, 3)
 print(result)
@@ -28,4 +30,3 @@ print(msg)
 flag: bool = True
 if flag:
     print("Flag is true")
-    
