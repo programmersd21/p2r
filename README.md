@@ -39,7 +39,7 @@
 ### 1. Clone Repository
 
 ```bash
-git clone https://github.com/pro-grammer-SD/p2r.git
+git clone https://github.com/programmersd/p2r.git
 cd p2r
 ```
 
